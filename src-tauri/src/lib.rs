@@ -3109,10 +3109,11 @@ fn watchdog_should_be_up(
 /// Every 5s, check whether the Python proxy is actually reachable while the
 /// app thinks the runtime should be up. If it isn't, try to restart via
 /// `ensure_headroom_running`. After 3 consecutive failures (~15s down) we
-/// give up: pause the runtime, strip Headroom's interception (BASE_URL,
-/// hooks, shell blocks) so Claude Code falls back to its normal behavior,
-/// and notify the user. The user can re-enable from the menu when ready —
-/// `start_headroom` re-applies everything via `restore_client_setups`.
+/// give up: pause the runtime, flip `proxy_bypass=true` so the Rust intercept
+/// passes traffic straight through to api.anthropic.com, and notify the user.
+/// The user's `~/.claude/settings.json` env, hook, and shell blocks stay
+/// intact — `start_headroom` clears bypass and brings Python back up without
+/// needing to re-install anything on disk.
 fn spawn_proxy_watchdog(app: AppHandle) {
     const POLL: std::time::Duration = std::time::Duration::from_secs(5);
     const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -3173,7 +3174,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                 log::error!(
-                    "watchdog: giving up after {MAX_CONSECUTIVE_FAILURES} failures; disabling interception"
+                    "watchdog: giving up after {MAX_CONSECUTIVE_FAILURES} failures; pausing runtime and bypassing to Anthropic"
                 );
                 // Capture once per down episode, BEFORE stop_headroom tears
                 // down the tracked child and the proxy log handle, so the
@@ -3184,16 +3185,21 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     consecutive_failures,
                     bypass_active,
                 );
+                // Flip bypass FIRST so the Rust intercept passes new
+                // requests straight through to Anthropic instead of returning
+                // 502 in the window between Python being torn down and the
+                // user noticing. See proxy_intercept.rs:161 — without this,
+                // every request lands on the unreachable backend branch.
+                state
+                    .proxy_bypass
+                    .store(true, std::sync::atomic::Ordering::Release);
                 state.set_runtime_paused(true);
                 state.stop_headroom();
-                if let Err(err) = client_adapters::clear_client_setups() {
-                    log::warn!("watchdog: clear_client_setups failed: {err}");
-                }
                 analytics::track_event(&app, "runtime_auto_paused", None);
                 let _ = show_notification_impl(
                     &app,
                     "Headroom paused",
-                    "Headroom couldn't restart its proxy — interception disabled so Claude Code keeps working. Open Headroom to try again.",
+                    "Headroom couldn't restart its proxy. Requests are passing through unmodified — open Headroom to retry.",
                     Some("connectors".into()),
                 );
                 consecutive_failures = 0;
