@@ -1129,6 +1129,89 @@ fn get_headroom_logs(
         .map_err(|err| err.to_string())
 }
 
+/// Authoritative "did the proxy receive a request" signal for the connector
+/// verification UI. Reads `/stats` on the live Rust front proxy and returns
+/// `requests.total`. The earlier verification path scanned the python proxy
+/// log for /v1/messages lines, but Claude Code traffic flows through the
+/// Rust proxy on 6767 — the python log only ever sees background/internal
+/// activity, so the regex match never fired even when the user's calls were
+/// being optimized normally.
+///
+/// `None` means the proxy is unreachable or `/stats` failed; the frontend
+/// must distinguish that from `Some(0)` ("up but no traffic yet"), otherwise
+/// a transient unreachable → reachable transition would look like a counter
+/// jump from 0 → N and falsely flip the badge to healthy.
+#[tauri::command]
+fn get_headroom_request_count() -> Option<u64> {
+    fetch_proxy_request_count_stats()
+}
+
+fn fetch_proxy_request_count_stats() -> Option<u64> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .ok()?;
+    for host in ["127.0.0.1", "localhost"] {
+        let url = format!("http://{host}:6767/stats");
+        let Ok(response) = client.get(&url).send() else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(body) = response.text() else { continue };
+        if let Some(count) = parse_request_count_from_stats_body(&body) {
+            return Some(count);
+        }
+    }
+    None
+}
+
+/// Pull `requests.total` (or any of the legacy spellings) out of a /stats
+/// JSON body. Mirrors the lookup in `state::parse_headroom_stats_from_json`
+/// but trimmed to just the counter we need for verification.
+pub(crate) fn parse_request_count_from_stats_body(body: &str) -> Option<u64> {
+    let root = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    if let Some(total) = root
+        .get("requests")
+        .and_then(|v| v.get("total"))
+        .and_then(|v| v.as_u64())
+    {
+        return Some(total);
+    }
+    for key in ["total_requests", "totalRequests", "requests_total"] {
+        if let Some(total) = find_u64_key_recursive_local(&root, key) {
+            return Some(total);
+        }
+    }
+    None
+}
+
+fn find_u64_key_recursive_local(value: &serde_json::Value, key: &str) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(found) = map.get(key).and_then(|v| v.as_u64()) {
+                return Some(found);
+            }
+            for v in map.values() {
+                if let Some(found) = find_u64_key_recursive_local(v, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(found) = find_u64_key_recursive_local(item, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 #[tauri::command]
 fn get_rtk_activity(
     state: State<'_, AppState>,
@@ -1815,6 +1898,17 @@ fn validate_contact_request_url(raw: &str) -> Option<reqwest::Url> {
 
 #[tauri::command]
 fn apply_client_setup(app: AppHandle, client_id: String) -> Result<ClientSetupResult, String> {
+    // The watchdog give-up path pauses the runtime and clears client setups
+    // (lib.rs ~3050). The tray-banner "Re-enable" button funnels through here
+    // to recover, so we also need to resume the runtime — without this, env
+    // vars get rewritten but the proxy stays down and Claude Code traffic
+    // hits a dead port until the desktop is restarted.
+    let state: tauri::State<'_, AppState> = app.state();
+    if state.runtime_is_paused() {
+        if let Err(err) = state.resume_runtime() {
+            log::warn!("apply_client_setup: resume_runtime failed: {err:#}");
+        }
+    }
     match client_adapters::apply_client_setup(&client_id) {
         Ok(result) => {
             analytics::track_event(
@@ -2192,6 +2286,7 @@ pub fn run() {
             dismiss_runtime_upgrade_failure,
             get_runtime_status,
             get_headroom_logs,
+            get_headroom_request_count,
             get_rtk_activity,
             get_tool_logs,
             get_claude_code_projects,
@@ -3588,7 +3683,8 @@ mod tests {
         count_memories_created_today, debounced_tray_runtime_visual, delete_applied_pattern,
         empty_live_learnings_for_projects, fetch_transformations_feed_from, install_pending_update,
         is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
-        parse_live_learnings, parse_updater_endpoint_list, pattern_matches_project,
+        parse_live_learnings, parse_request_count_from_stats_body, parse_updater_endpoint_list,
+        pattern_matches_project,
         physical_rect_from_rect, read_applied_patterns_for_project, resolve_release_updater_config,
         select_updater_endpoints, store_checked_update, watchdog_should_be_up,
         AvailableAppUpdate, BootstrapFailureKind, HeadroomLearnPrereqStatus,
@@ -4708,6 +4804,38 @@ Some unrelated content.
             "venv interpreter exited with status 1"
         ));
         assert!(!is_port_conflict_failure(""));
+    }
+
+    #[test]
+    fn parse_request_count_reads_nested_requests_total() {
+        let body = json!({
+            "requests": { "total": 42, "active": 1 },
+            "tokens": { "saved": 100 }
+        })
+        .to_string();
+        assert_eq!(parse_request_count_from_stats_body(&body), Some(42));
+    }
+
+    #[test]
+    fn parse_request_count_falls_back_to_legacy_keys() {
+        // Older /stats payloads exposed the count under flat keys. The
+        // verification poller has to keep working against any of them or it
+        // will get stuck on a runtime mid-upgrade between schema versions.
+        let body = json!({ "total_requests": 7 }).to_string();
+        assert_eq!(parse_request_count_from_stats_body(&body), Some(7));
+
+        let body = json!({ "totalRequests": 9 }).to_string();
+        assert_eq!(parse_request_count_from_stats_body(&body), Some(9));
+
+        let body = json!({ "nested": { "requests_total": 11 } }).to_string();
+        assert_eq!(parse_request_count_from_stats_body(&body), Some(11));
+    }
+
+    #[test]
+    fn parse_request_count_returns_none_when_absent() {
+        let body = json!({ "tokens": { "saved": 100 } }).to_string();
+        assert_eq!(parse_request_count_from_stats_body(&body), None);
+        assert_eq!(parse_request_count_from_stats_body("not json"), None);
     }
 
     #[test]
