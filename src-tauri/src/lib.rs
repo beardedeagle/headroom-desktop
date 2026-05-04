@@ -1,5 +1,6 @@
 mod activity_facts;
 mod analytics;
+mod backend_port;
 mod bearer;
 mod claude_cli;
 mod client_adapters;
