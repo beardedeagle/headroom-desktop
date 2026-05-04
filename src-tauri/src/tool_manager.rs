@@ -443,17 +443,7 @@ impl ToolManager {
                 bail!("headroom managed python not found at {}", python.display());
             }
 
-            // Use the console_scripts entrypoint when available to avoid the Python
-            // -m double-import RuntimeWarning. Fall back to -m if missing.
             let entrypoint = self.headroom_entrypoint();
-            let startup_variants: Vec<(PathBuf, Vec<String>)> = if entrypoint.exists() {
-                vec![
-                    (entrypoint, headroom_entrypoint_startup_args()),
-                    (python.clone(), headroom_python_startup_args()),
-                ]
-            } else {
-                vec![(python.clone(), headroom_python_startup_args())]
-            };
 
             let mut failures: Vec<HeadroomStartupFailure> = Vec::new();
             let logs_dir = self.runtime.logs_dir();
@@ -546,6 +536,21 @@ impl ToolManager {
                     }
                 }
             }
+
+            // Construct spawn variants AFTER pre-flight so `--port` reflects any
+            // fallback chosen above. The arg helpers read `backend_port::get()`
+            // eagerly; building them earlier bakes in the stale default and the
+            // proxy ends up trying to bind the foreign-held port.
+            // Use the console_scripts entrypoint when available to avoid the Python
+            // -m double-import RuntimeWarning. Fall back to -m if missing.
+            let startup_variants: Vec<(PathBuf, Vec<String>)> = if entrypoint.exists() {
+                vec![
+                    (entrypoint, headroom_entrypoint_startup_args()),
+                    (python.clone(), headroom_python_startup_args()),
+                ]
+            } else {
+                vec![(python.clone(), headroom_python_startup_args())]
+            };
 
             for (executable, args) in &startup_variants {
                 let variant = if args.is_empty() {
@@ -4780,6 +4785,36 @@ mod tests {
         assert!(!python_args.contains(&"--no-memory-tools".to_string()));
         assert!(!python_args.contains(&"--no-memory-context".to_string()));
         assert!(!python_args.contains(&"--memory-db-path".to_string()));
+
+        backend_port::reset_for_tests();
+    }
+
+    /// Regression: `start_headroom_background` previously built `startup_variants`
+    /// before pre-flight ran, so when fallback called `backend_port::set(6769)`
+    /// the variants still spawned with `--port 6768` and both failed with
+    /// EADDRINUSE. The arg helpers read the atomic at call time, so as long as
+    /// the helpers are invoked AFTER fallback has updated the atomic, the
+    /// chosen fallback port flows through.
+    #[test]
+    fn startup_args_reflect_fallback_port_set_after_default() {
+        backend_port::reset_for_tests();
+        backend_port::set(6770);
+
+        let entrypoint_args = headroom_entrypoint_startup_args();
+        let port_idx = entrypoint_args
+            .iter()
+            .position(|a| a == "--port")
+            .expect("entrypoint args contain --port");
+        assert_eq!(entrypoint_args[port_idx + 1], "6770");
+
+        let python_args = headroom_python_startup_args();
+        let port_idx = python_args
+            .iter()
+            .position(|a| a == "--port")
+            .expect("python args contain --port");
+        assert_eq!(python_args[port_idx + 1], "6770");
+
+        backend_port::reset_for_tests();
     }
 
     #[test]

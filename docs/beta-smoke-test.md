@@ -70,18 +70,23 @@ curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:6767/livez"
 ```
 Expect: at least one `127.0.0.1:67XX` line in the 6768-6790 range, and the curl returns `200`.
 
-Then, force a fallback. Quit Headroom, hold 6768 with `nc`, relaunch, and confirm the proxy comes up on a different port:
+Then, force a fallback. Quit Headroom, hold 6768 with a Python blocker (`nc -l` exits after one connection, so the proxy's first probe frees the port before fallback can trigger), relaunch, and confirm the proxy comes up on a different port. The proxy on a fallback port boots cold (memory tools / model load), so poll `/livez` for up to 90s instead of a fixed sleep:
 ```bash
 osascript -e 'quit app "Headroom"' 2>/dev/null; sleep 2
-nc -l 6768 &
-NC_PID=$!
+python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6768)); s.listen(16); time.sleep(180)" &
+BLOCK_PID=$!
+sleep 1
 open -a Headroom
-sleep 30
-lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | awk '$1 ~ /(headroom|python)/ && $9 ~ /:(67[6-9][0-9]|6790)/ { print $9 }'
-curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:6767/livez"
-kill $NC_PID 2>/dev/null
+for _ in $(seq 1 90); do
+  code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:6767/livez" 2>/dev/null)
+  [ "$code" = "200" ] && break
+  sleep 1
+done
+echo "livez=$code"
+lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | awk -v IGNORECASE=1 '$1 ~ /(headroom|python)/ && $9 ~ /:(67[6-9][0-9]|6790)/ { print $9 }'
+kill $BLOCK_PID 2>/dev/null
 ```
-Expect: a `127.0.0.1:67XX` line where `XX` is NOT `68` (the fallback worked), and the curl still returns `200`. After the test, quit + relaunch Headroom so the next session goes back to 6768.
+Expect: `livez=200`, a `127.0.0.1:67XX` line where `XX` is NOT `68` (the fallback worked). After the test, quit + relaunch Headroom so the next session goes back to 6768.
 
 If the fallback is missing, check `~/Library/Application Support/Headroom/headroom/logs/` for a `[backend_port]` warning line that names the occupant and the chosen fallback port.
 
