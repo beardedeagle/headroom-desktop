@@ -4906,7 +4906,15 @@ export default function App() {
             );
             const action = isDowngrade ? "downgrade" : "upgrade";
             const actionTitle = isDowngrade ? "Downgrade" : "Upgrade";
-            const renewalPriceLabel = getPlanRenewalPriceLabel(
+            const currentPriceLabel = getPlanRenewalPriceLabel(
+              pendingPlanChange.fromTier,
+              pendingPlanChange.billingPeriod,
+              {
+                fromTier: pendingPlanChange.fromTier,
+                currentPaidCents: pricingStatus?.account?.subscriptionAmountCents
+              }
+            );
+            const newPriceLabel = getPlanRenewalPriceLabel(
               pendingPlanChange.toTier,
               pendingPlanChange.billingPeriod,
               {
@@ -4925,34 +4933,33 @@ export default function App() {
                   <h3>Confirm your {action}</h3>
                   <p>
                     You'll {action} from your{" "}
+                    <strong>{currentPriceLabel}</strong>{" "}
                     <strong>{upgradePlanIntentLabel(pendingPlanChange.fromTier)}</strong>{" "}
-                    plan to{" "}
-                    <strong>{upgradePlanIntentLabel(pendingPlanChange.toTier)}</strong>.
+                    plan to the{" "}
+                    <strong>{newPriceLabel}</strong>{" "}
+                    <strong>{upgradePlanIntentLabel(pendingPlanChange.toTier)}</strong>{" "}
+                    plan.
                   </p>
                   <p>
                     {isDowngrade
                       ? "You'll receive a prorated credit toward your next billing cycle for the unused time on your current plan."
                       : "You'll be charged a prorated amount today for the remaining time in your current billing period."}
                   </p>
-                  <p>
-                    Your subscription will then renew at{" "}
-                    <strong>{renewalPriceLabel}</strong>
-                    {pricingStatus?.account?.subscriptionRenewsAt ? (
-                      <>
-                        {" "}on{" "}
-                        <strong>
-                          {new Date(
-                            pricingStatus.account.subscriptionRenewsAt
-                          ).toLocaleDateString(undefined, {
-                            year: "numeric",
-                            month: "long",
-                            day: "numeric"
-                          })}
-                        </strong>
-                      </>
-                    ) : null}
-                    .
-                  </p>
+                  {pricingStatus?.account?.subscriptionRenewsAt ? (
+                    <p>
+                      Your subscription will then renew on{" "}
+                      <strong>
+                        {new Date(
+                          pricingStatus.account.subscriptionRenewsAt
+                        ).toLocaleDateString(undefined, {
+                          year: "numeric",
+                          month: "long",
+                          day: "numeric"
+                        })}
+                      </strong>
+                      .
+                    </p>
+                  ) : null}
                   {planChangeError ? (
                     <p className="install-progress__error">{planChangeError}</p>
                   ) : null}
