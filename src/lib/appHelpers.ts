@@ -15,6 +15,103 @@ const PLAN_PRICES: Record<
   max5x: { annual: { full: "$20", fullCents: 2000, discounted: "$10"   }, monthly: { full: "$30",   fullCents: 3000, discounted: "$15"   } },
   max20x:{ annual: { full: "$40", fullCents: 4000, discounted: "$20"   }, monthly: { full: "$60",   fullCents: 6000, discounted: "$30"   } },
 };
+const TIER_RANK: Record<HeadroomSubscriptionTier, number> = { pro: 1, max5x: 2, max20x: 3 };
+
+export function isTierDowngrade(
+  fromTier: HeadroomSubscriptionTier,
+  toTier: HeadroomSubscriptionTier
+): boolean {
+  return TIER_RANK[toTier] < TIER_RANK[fromTier];
+}
+
+function projectPerMonthCents(
+  toTier: HeadroomSubscriptionTier,
+  billingPeriod: BillingPeriod,
+  options?: { fromTier?: HeadroomSubscriptionTier; currentPaidCents?: number | null }
+): number {
+  // PLAN_PRICES.fullCents is per-month even on annual cycles.
+  const toFullPerMonth = PLAN_PRICES[toTier][billingPeriod].fullCents;
+  const fromTier = options?.fromTier;
+  const currentPaidCents = options?.currentPaidCents ?? null;
+  if (!fromTier || currentPaidCents === null) return toFullPerMonth;
+  const fromFullPerMonth = PLAN_PRICES[fromTier][billingPeriod].fullCents;
+  if (fromFullPerMonth <= 0) return toFullPerMonth;
+  // Polar reports subscription_amount_cents per full billing cycle (12x
+  // per-month for annual), so normalize to per-month before the ratio math.
+  const cycleMonths = billingPeriod === "annual" ? 12 : 1;
+  const currentPaidPerMonth = currentPaidCents / cycleMonths;
+  return Math.round(toFullPerMonth * (currentPaidPerMonth / fromFullPerMonth));
+}
+
+function formatCents(cents: number): string {
+  const dollars = cents / 100;
+  return cents % 100 === 0 ? `$${dollars}` : `$${dollars.toFixed(2)}`;
+}
+
+/// Per-month price label for the target tier (e.g. `$20 / month`), with the
+/// user's current discount ratio carried forward. Matches the upgrade view
+/// convention where annual prices are shown per-month for tier comparison.
+export function getPlanRenewalPriceLabel(
+  toTier: HeadroomSubscriptionTier,
+  billingPeriod: BillingPeriod,
+  options?: { fromTier?: HeadroomSubscriptionTier; currentPaidCents?: number | null }
+): string {
+  return `${formatCents(projectPerMonthCents(toTier, billingPeriod, options))} / month`;
+}
+
+/// Total amount charged on a single billing cycle (e.g. `$120` for a 50%-off
+/// Max x5 annual subscriber paying $10/month for 12 months upfront). Used in
+/// the upgrade confirmation modal when telling a checkout-bound user the
+/// dollar figure they'll see on Polar's checkout.
+export function getPlanCycleTotalLabel(
+  toTier: HeadroomSubscriptionTier,
+  billingPeriod: BillingPeriod,
+  options?: { fromTier?: HeadroomSubscriptionTier; currentPaidCents?: number | null }
+): string {
+  const perMonth = projectPerMonthCents(toTier, billingPeriod, options);
+  const cycleMonths = billingPeriod === "annual" ? 12 : 1;
+  return formatCents(perMonth * cycleMonths);
+}
+
+/// Full-price cents for one complete billing cycle (annual = 12x the per-
+/// month figure, monthly = 1x).
+export function standardListPriceCents(
+  tier: HeadroomSubscriptionTier,
+  billingPeriod: BillingPeriod
+): number {
+  const perMonth = PLAN_PRICES[tier][billingPeriod].fullCents;
+  const cycleMonths = billingPeriod === "annual" ? 12 : 1;
+  return perMonth * cycleMonths;
+}
+
+/// Returns true when the user is effectively running with an active launch
+/// discount. The primary signal is the synced `subscription_discount_duration`,
+/// but that goes null after a `once`-duration discount is consumed by its
+/// first invoice — leaving the user looking "undiscounted" even though Polar's
+/// launch discount is still globally active and the user is paying below list.
+/// The secondary signal catches that case so the desktop doesn't silently
+/// route them into a PATCH that bills the full prorated diff.
+export function detectSubscriberHasDiscount(args: {
+  subscriptionDiscountDuration?: string | null;
+  launchDiscountActive?: boolean;
+  currentTier?: HeadroomSubscriptionTier | null;
+  currentBillingPeriod?: BillingPeriod | null;
+  subscriptionAmountCents?: number | null;
+}): boolean {
+  if (args.subscriptionDiscountDuration) return true;
+  if (
+    args.launchDiscountActive &&
+    args.currentTier &&
+    args.currentBillingPeriod &&
+    args.subscriptionAmountCents !== null &&
+    args.subscriptionAmountCents !== undefined
+  ) {
+    const listCents = standardListPriceCents(args.currentTier, args.currentBillingPeriod);
+    return args.subscriptionAmountCents < listCents;
+  }
+  return false;
+}
+
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
 type IndividualUpgradePlanId = "free" | "pro" | "max5x" | "max20x";
 type PaidUpgradePlanId = HeadroomSubscriptionTier;
@@ -25,6 +122,8 @@ export interface UpgradePlanPurchaseInfo {
   renewsOn: string;
   paidPerMonthLabel: string;
   discountPct: number;
+  cancelAtPeriodEnd?: boolean;
+  endsOn?: string;
 }
 
 export interface UpgradePlan {
@@ -113,12 +212,18 @@ export function getUpgradePlans(
   subscriptionRenewsAt?: string | null,
   subscriptionStartedAt?: string | null,
   subscriptionDiscountDuration?: string | null,
-  subscriptionDiscountDurationInMonths?: number | null
+  subscriptionDiscountDurationInMonths?: number | null,
+  subscriptionCancelAtPeriodEnd: boolean = false,
+  subscriptionEndsAt?: string | null
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
 } {
   if (audience === "individual") {
+    const downgradeEndsOn = subscriptionCancelAtPeriodEnd && subscriptionEndsAt
+      ? new Date(subscriptionEndsAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
+      : undefined;
+
     const freePlan: UpgradePlan = {
       id: "free",
       name: "Free",
@@ -131,9 +236,20 @@ export function getUpgradePlans(
         "Use with 25% of your Claude plan",
         "Optimize Claude Code practices"
       ],
-      ctaLabel: "Stay on Free plan",
+      ctaLabel: downgradeEndsOn ? "Downgrade scheduled" : "Stay on Free plan",
       ctaVariant: "secondary",
-      ctaTone: "default"
+      ctaTone: "default",
+      ...(downgradeEndsOn
+        ? {
+            purchaseInfo: {
+              renewsOn: downgradeEndsOn,
+              paidPerMonthLabel: "$0",
+              discountPct: 0,
+              cancelAtPeriodEnd: true,
+              endsOn: downgradeEndsOn
+            }
+          }
+        : {})
     };
 
     const billingLabel = billingPeriod === "annual" ? "billed annually" : "billed monthly";
@@ -187,7 +303,16 @@ export function getUpgradePlans(
         ? new Date(subscriptionRenewsAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
         : null;
       if (!renewsOn) return undefined;
-      return { renewsOn, paidPerMonthLabel, discountPct };
+      const endsOn = subscriptionCancelAtPeriodEnd && subscriptionEndsAt
+        ? new Date(subscriptionEndsAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
+        : undefined;
+      return {
+        renewsOn,
+        paidPerMonthLabel,
+        discountPct,
+        cancelAtPeriodEnd: subscriptionCancelAtPeriodEnd,
+        endsOn
+      };
     })();
 
     function paidPlan(
@@ -199,8 +324,10 @@ export function getUpgradePlans(
       ctaLabel: string
     ): UpgradePlan {
       const prices = PLAN_PRICES[id][billingPeriod];
-      // When user has an active plan, always show full prices — no discount badges.
-      const showDiscount = launchDiscountActive && !activeHeadroomPlanId;
+      // Upgrade-target cards show the discounted price because checkout always
+      // attaches the launch discount; the active plan card uses purchaseInfo
+      // (actual paid amount) instead of a generic discount badge.
+      const showDiscount = launchDiscountActive && id !== activeHeadroomPlanId;
       const price = showDiscount ? prices.discounted : prices.full;
       return {
         id,
@@ -238,6 +365,12 @@ export function getUpgradePlans(
 
     const withRelativeCta = (plan: UpgradePlan): UpgradePlan => {
       if (!activeHeadroomPlanId) {
+        return plan;
+      }
+
+      // Free card during a scheduled downgrade is the pending target — its
+      // CTA was set to "Downgrade scheduled" above and must not be overridden.
+      if (plan.purchaseInfo?.cancelAtPeriodEnd && plan.id !== activeHeadroomPlanId) {
         return plan;
       }
 

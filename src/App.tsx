@@ -43,6 +43,7 @@ import {
 import headroomLogo from "./assets/headroom-logo.svg";
 import packageJson from "../package.json";
 import {
+  formatAppUpdateProgressCopy,
   getAppUpdateInstallStatusCopy,
   getBlockedAppUpdateCheckPatch,
   loadAppUpdateConfiguration,
@@ -60,8 +61,12 @@ import {
 } from "./lib/urgentNotifications";
 import {
   describeInvokeError,
+  detectSubscriberHasDiscount,
   getNextLowerUpgradePlanId,
+  getPlanCycleTotalLabel,
+  getPlanRenewalPriceLabel,
   getUpgradePlans,
+  isTierDowngrade,
   upgradePlanIntentLabel,
   type BillingPeriod,
   type PricingAudience,
@@ -144,6 +149,7 @@ import type {
   DashboardState,
   HeadroomLearnPrereqStatus,
   HeadroomLearnStatus,
+  HeadroomSubscriptionTier,
   ActivityFeedResponse,
   AppliedPatterns,
   HourlySavingsPoint,
@@ -703,7 +709,18 @@ export default function App() {
   const [uninstallError, setUninstallError] = useState<string | null>(null);
   const [upgradeActionBusy, setUpgradeActionBusy] = useState<UpgradePlanId | null>(null);
   const [upgradeActionError, setUpgradeActionError] = useState<string | null>(null);
+  const [pendingPlanChange, setPendingPlanChange] = useState<{
+    fromTier: HeadroomSubscriptionTier;
+    toTier: HeadroomSubscriptionTier;
+    billingPeriod: BillingPeriod;
+    flowKind: "patch" | "checkout";
+  } | null>(null);
+  const [planChangeBusy, setPlanChangeBusy] = useState(false);
+  const [planChangeError, setPlanChangeError] = useState<string | null>(null);
+  const [reactivateBusy, setReactivateBusy] = useState(false);
+  const [reactivateError, setReactivateError] = useState<string | null>(null);
   const [contactEmail, setContactEmail] = useState("");
+  const [contactMessage, setContactMessage] = useState("");
   const [contactSubmitBusy, setContactSubmitBusy] = useState(false);
   const [contactSubmitError, setContactSubmitError] = useState<string | null>(null);
   const [contactSubmitSuccess, setContactSubmitSuccess] = useState<string | null>(null);
@@ -734,7 +751,9 @@ export default function App() {
     pricingStatus?.account?.subscriptionRenewsAt,
     pricingStatus?.account?.subscriptionStartedAt,
     pricingStatus?.account?.subscriptionDiscountDuration,
-    pricingStatus?.account?.subscriptionDiscountDurationInMonths
+    pricingStatus?.account?.subscriptionDiscountDurationInMonths,
+    pricingStatus?.account?.subscriptionCancelAtPeriodEnd ?? false,
+    pricingStatus?.account?.subscriptionEndsAt
   );
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
@@ -848,6 +867,28 @@ export default function App() {
     if (!pricingStatus) return;
     writeCachedPricing(cachePricingStatus(pricingStatus));
   }, [pricingStatus]);
+
+  useEffect(() => {
+    const STORAGE_KEY = "headroom:lastNotifiedMismatchTier";
+    const mismatch = pricingStatus?.tierMismatch;
+    if (!mismatch) {
+      window.localStorage.removeItem(STORAGE_KEY);
+      return;
+    }
+    const rank: Record<string, number> = { pro: 1, max5x: 2, max20x: 3 };
+    const previous = window.localStorage.getItem(STORAGE_KEY);
+    // Notify on first detection and whenever the recommended tier climbs higher.
+    if (previous !== null && (rank[mismatch.recommendedTier] ?? 0) <= (rank[previous] ?? 0)) {
+      return;
+    }
+    const paidLabel = upgradePlanIntentLabel(mismatch.paidTier);
+    const recommendedLabel = upgradePlanIntentLabel(mismatch.recommendedTier);
+    void invoke("show_notification", {
+      title: "Upgrade your Headroom plan",
+      body: `Your Claude ${recommendedLabel} plan is above your Headroom ${paidLabel} plan. Upgrade to keep unlimited optimization.`,
+    }).catch(() => {});
+    window.localStorage.setItem(STORAGE_KEY, mismatch.recommendedTier);
+  }, [pricingStatus?.tierMismatch?.recommendedTier, pricingStatus?.tierMismatch]);
 
   useEffect(() => {
     const claudeConnector = getClaudeConnector(connectors);
@@ -2066,7 +2107,15 @@ export default function App() {
     }
 
     try {
-      applyAppUpdatePatch(await runAppUpdateInstall({ availableUpdate: appUpdateAvailable }));
+      const versionForCopy = appUpdateAvailable.version;
+      applyAppUpdatePatch(
+        await runAppUpdateInstall({
+          availableUpdate: appUpdateAvailable,
+          onProgress: (progress) => {
+            setAppUpdateStatusCopy(formatAppUpdateProgressCopy(versionForCopy, progress));
+          },
+        })
+      );
     } finally {
       setAppUpdateInstallBusy(false);
     }
@@ -2385,6 +2434,25 @@ export default function App() {
       pricingStatus?.account?.subscriptionActive
         ? pricingStatus.account.subscriptionTier ?? null
         : null;
+    const accountBillingPeriod = pricingStatus?.account?.subscriptionBillingPeriod;
+    const currentBillingPeriod: BillingPeriod | null =
+      accountBillingPeriod === "annual" || accountBillingPeriod === "monthly"
+        ? accountBillingPeriod
+        : null;
+    // Treat the user as discounted when sync explicitly reports a discount OR
+    // when the launch discount is globally active and the user is paying
+    // below list — the latter catches the case where a `once`-duration
+    // discount has been consumed by its first invoice but the user is still
+    // morally entitled to the launch deal on future charges. Without this
+    // second branch, those users silently route into a PATCH that bills the
+    // full prorated diff (see the LAUNCH1YEAR `once` incident).
+    const subscriberHasDiscount = detectSubscriberHasDiscount({
+      subscriptionDiscountDuration: pricingStatus?.account?.subscriptionDiscountDuration,
+      launchDiscountActive: pricingStatus?.launchDiscountActive,
+      currentTier: activeHeadroomPlanId,
+      currentBillingPeriod,
+      subscriptionAmountCents: pricingStatus?.account?.subscriptionAmountCents
+    });
     const action = (() => {
       switch (planId) {
         case "free":
@@ -2392,17 +2460,21 @@ export default function App() {
             kind: activeHeadroomPlanId ? "billing_portal" as const : "internal" as const
           };
         case "pro":
-          return {
-            kind: activeHeadroomPlanId === planId ? "internal" as const : "checkout" as const
-          };
         case "max5x":
-          return {
-            kind: activeHeadroomPlanId === planId ? "internal" as const : "checkout" as const
-          };
-        case "max20x":
-          return {
-            kind: activeHeadroomPlanId === planId ? "internal" as const : "checkout" as const
-          };
+        case "max20x": {
+          if (activeHeadroomPlanId === planId) return { kind: "internal" as const };
+          if (activeHeadroomPlanId) {
+            // Only discounted *upgrades* go through a fresh Polar Checkout (so
+            // the discount applies to the immediate charge). Downgrades and
+            // non-discount changes use the PATCH path, also gated by the
+            // confirmation modal.
+            const isUpgrade = !isTierDowngrade(activeHeadroomPlanId, planId);
+            return subscriberHasDiscount && isUpgrade
+              ? { kind: "upgrade_checkout" as const }
+              : { kind: "change_plan" as const };
+          }
+          return { kind: "checkout" as const };
+        }
         case "team":
           return {
             kind: "external" as const,
@@ -2441,6 +2513,19 @@ export default function App() {
       return;
     }
 
+    if (action.kind === "change_plan" || action.kind === "upgrade_checkout") {
+      const fromTier = pricingStatus?.account?.subscriptionTier;
+      if (!fromTier) return;
+      setPlanChangeError(null);
+      setPendingPlanChange({
+        fromTier,
+        toTier: planId as HeadroomSubscriptionTier,
+        billingPeriod,
+        flowKind: action.kind === "upgrade_checkout" ? "checkout" : "patch"
+      });
+      return;
+    }
+
     if (action.kind === "checkout") {
       setUpgradeActionBusy(planId);
       setUpgradeActionError(null);
@@ -2470,7 +2555,11 @@ export default function App() {
       setUpgradeActionError(null);
 
       try {
-        const url = await invoke<string>("get_headroom_billing_portal_url");
+        // Deep-link to the user's subscription page so they land one click
+        // away from "Change plan" instead of at the portal root.
+        const url = await invoke<string>("get_headroom_billing_portal_url", {
+          target: "subscription"
+        });
         await openExternalLink(url);
       } catch (error) {
         setUpgradeActionError(
@@ -2501,6 +2590,66 @@ export default function App() {
     }
   }
 
+  async function confirmPlanChange() {
+    if (!pendingPlanChange) return;
+    setPlanChangeBusy(true);
+    setPlanChangeError(null);
+    try {
+      if (pendingPlanChange.flowKind === "checkout") {
+        const url = await invoke<string>("create_headroom_checkout_session", {
+          subscriptionTier: pendingPlanChange.toTier,
+          billingPeriod: pendingPlanChange.billingPeriod
+        });
+        await openExternalLink(url);
+        setPendingPlanChange(null);
+      } else {
+        await invoke("change_headroom_subscription_plan", {
+          subscriptionTier: pendingPlanChange.toTier,
+          billingPeriod: pendingPlanChange.billingPeriod
+        });
+        await refreshPricingStatus();
+        setPendingPlanChange(null);
+        setActiveView("home");
+      }
+    } catch (error) {
+      setPlanChangeError(
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Could not change subscription plan."
+      );
+    } finally {
+      setPlanChangeBusy(false);
+    }
+  }
+
+  function cancelPlanChange() {
+    if (planChangeBusy) return;
+    setPendingPlanChange(null);
+    setPlanChangeError(null);
+  }
+
+  async function handleReactivateSubscription() {
+    if (reactivateBusy) return;
+    setReactivateBusy(true);
+    setReactivateError(null);
+    try {
+      await invoke("reactivate_headroom_subscription");
+      await refreshPricingStatus();
+    } catch (error) {
+      setReactivateError(
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Could not reactivate subscription."
+      );
+    } finally {
+      setReactivateBusy(false);
+    }
+  }
+
   async function handleContactSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -2512,13 +2661,19 @@ export default function App() {
     }
 
     const trimmed = contactEmail.trim();
+    const trimmedMessage = contactMessage.trim().slice(0, 2000);
     setContactSubmitBusy(true);
     setContactSubmitError(null);
     setContactSubmitSuccess(null);
 
     try {
-      await invoke("submit_contact_request", { url: CONTACT_FORM_URL, email: trimmed });
+      await invoke("submit_contact_request", {
+        url: CONTACT_FORM_URL,
+        email: trimmed,
+        message: trimmedMessage || null,
+      });
       setContactEmail("");
+      setContactMessage("");
       setContactSubmitSuccess("Thanks. Check your inbox for a confirmation email.");
     } catch (error) {
       setContactSubmitError(
@@ -3505,6 +3660,7 @@ export default function App() {
           }
           return `Headroom needs attention: ${primaryIssue}.`;
         })();
+  const tierMismatch = pricingStatus?.tierMismatch ?? null;
   const sortedClaudeProjects = [...claudeProjects].sort((left, right) => {
     const leftTime = Date.parse(left.lastWorkedAt);
     const rightTime = Date.parse(right.lastWorkedAt);
@@ -3821,6 +3977,33 @@ export default function App() {
 
       <section className="tray-panel">
         <div className="tray-content" hidden={activeView !== "home"}>
+            {tierMismatch ? (
+              <section className="tier-mismatch-banner" role="alert">
+                <div className="tier-mismatch-banner__body">
+                  <h2 className="tier-mismatch-banner__title">Upgrade your Headroom plan</h2>
+                  <p className="tier-mismatch-banner__message">
+                    {tierMismatch.clamped
+                      ? `Your Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan no longer matches your Claude ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} usage, so weekly usage limits now apply. Upgrade to restore unlimited optimization.`
+                      : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your Claude account is ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}. Upgrade to match your Claude plan.`}
+                  </p>
+                  {upgradeActionError && upgradeActionBusy === null ? (
+                    <p className="tier-mismatch-banner__error" role="status">
+                      {upgradeActionError}
+                    </p>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  className="tier-mismatch-banner__action"
+                  disabled={upgradeActionBusy === tierMismatch.recommendedTier}
+                  onClick={() => void handleUpgradeAction(tierMismatch.recommendedTier)}
+                >
+                  {upgradeActionBusy === tierMismatch.recommendedTier
+                    ? "Updating…"
+                    : `Upgrade to ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}`}
+                </button>
+              </section>
+            ) : null}
             <section className={`callout-banner callout-banner--${calloutBanner.tone}`}>
               <span className={`callout-banner__dot callout-banner__dot--${calloutBanner.tone}`} aria-hidden="true" />
               <div className="callout-banner__body">
@@ -4241,11 +4424,17 @@ export default function App() {
                         </span>
                       </div>
                     )}
-                    {isActivePlan && plan.purchaseInfo ? (
+                    {plan.purchaseInfo ? (
                       <p className="upgrade-plan-card__purchase-info">
-                        {plan.purchaseInfo.discountPct > 0
-                          ? `Renews ${plan.purchaseInfo.paidPerMonthLabel}/mo on ${plan.purchaseInfo.renewsOn} (${plan.purchaseInfo.discountPct}% off)`
-                          : `Renews ${plan.price}/mo on ${plan.purchaseInfo.renewsOn}`}
+                        {plan.purchaseInfo.cancelAtPeriodEnd && plan.purchaseInfo.endsOn
+                          ? plan.id === "free"
+                            ? `Activates on ${plan.purchaseInfo.endsOn}`
+                            : `Downgrades to Free on ${plan.purchaseInfo.endsOn}`
+                          : isActivePlan
+                          ? plan.purchaseInfo.discountPct > 0
+                            ? `Renews ${plan.purchaseInfo.paidPerMonthLabel}/mo on ${plan.purchaseInfo.renewsOn} (${plan.purchaseInfo.discountPct}% off)`
+                            : `Renews ${plan.price}/mo on ${plan.purchaseInfo.renewsOn}`
+                          : null}
                       </p>
                     ) : null}
                   </div>
@@ -4267,6 +4456,22 @@ export default function App() {
                           type="email"
                           value={contactEmail}
                         />
+                        <textarea
+                          className="upgrade-plan-card__contact-textarea"
+                          maxLength={2000}
+                          onChange={(event) => {
+                            setContactMessage(event.target.value);
+                            if (contactSubmitError) {
+                              setContactSubmitError(null);
+                            }
+                            if (contactSubmitSuccess) {
+                              setContactSubmitSuccess(null);
+                            }
+                          }}
+                          placeholder="Tell us about your team and what you're looking for (optional)"
+                          rows={4}
+                          value={contactMessage}
+                        />
                         <button
                           className={`secondary-button upgrade-plan-card__button upgrade-plan-card__contact-submit${contactEmailValid ? " is-ready" : ""}`}
                           disabled={!contactEmailValid || contactSubmitBusy}
@@ -4275,6 +4480,23 @@ export default function App() {
                           {contactSubmitBusy ? "Sending..." : plan.ctaLabel}
                         </button>
                       </form>
+                    ) : isActivePlan && plan.purchaseInfo?.cancelAtPeriodEnd ? (
+                      <button
+                        className={buttonClassName}
+                        disabled={reactivateBusy}
+                        onClick={() => void handleReactivateSubscription()}
+                        type="button"
+                      >
+                        {reactivateBusy ? "Resuming..." : `Resume ${plan.name} plan`}
+                      </button>
+                    ) : plan.id === "free" && plan.purchaseInfo?.cancelAtPeriodEnd ? (
+                      <button
+                        className={buttonClassName}
+                        disabled
+                        type="button"
+                      >
+                        {plan.ctaLabel}
+                      </button>
                     ) : (
                       <button
                         className={buttonClassName}
@@ -4322,6 +4544,9 @@ export default function App() {
 
           {upgradeActionError ? (
             <p className="install-progress__error">{upgradeActionError}</p>
+          ) : null}
+          {reactivateError ? (
+            <p className="install-progress__error">{reactivateError}</p>
           ) : null}
         </div>
 
@@ -4782,6 +5007,132 @@ export default function App() {
               </div>
             </div>
           ) : null}
+
+          {pendingPlanChange ? (() => {
+            const isDowngrade = isTierDowngrade(
+              pendingPlanChange.fromTier,
+              pendingPlanChange.toTier
+            );
+            const action = isDowngrade ? "downgrade" : "upgrade";
+            const actionTitle = isDowngrade ? "Downgrade" : "Upgrade";
+            const currentPriceLabel = getPlanRenewalPriceLabel(
+              pendingPlanChange.fromTier,
+              pendingPlanChange.billingPeriod,
+              {
+                fromTier: pendingPlanChange.fromTier,
+                currentPaidCents: pricingStatus?.account?.subscriptionAmountCents
+              }
+            );
+            const newPriceLabel = getPlanRenewalPriceLabel(
+              pendingPlanChange.toTier,
+              pendingPlanChange.billingPeriod,
+              {
+                fromTier: pendingPlanChange.fromTier,
+                currentPaidCents: pricingStatus?.account?.subscriptionAmountCents
+              }
+            );
+            const newCycleTotalLabel = getPlanCycleTotalLabel(
+              pendingPlanChange.toTier,
+              pendingPlanChange.billingPeriod,
+              {
+                fromTier: pendingPlanChange.fromTier,
+                currentPaidCents: pricingStatus?.account?.subscriptionAmountCents
+              }
+            );
+            const billingCycleLabel =
+              pendingPlanChange.billingPeriod === "annual" ? "year" : "month";
+            const isCheckoutFlow = pendingPlanChange.flowKind === "checkout";
+            return (
+              <div
+                className="modal-backdrop"
+                role="dialog"
+                aria-modal="true"
+                onClick={cancelPlanChange}
+              >
+                <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                  <h3>Confirm your {action}</h3>
+                  <p>
+                    You'll {action} from your{" "}
+                    <strong>{currentPriceLabel}</strong>{" "}
+                    <strong>{upgradePlanIntentLabel(pendingPlanChange.fromTier)}</strong>{" "}
+                    plan to the{" "}
+                    <strong>{newPriceLabel}</strong>{" "}
+                    <strong>{upgradePlanIntentLabel(pendingPlanChange.toTier)}</strong>{" "}
+                    plan, billed{" "}
+                    {pendingPlanChange.billingPeriod === "annual" ? "annually" : "monthly"}.
+                  </p>
+                  {isCheckoutFlow ? (
+                    <>
+                      <p>
+                        You'll be charged{" "}
+                        <strong>{newCycleTotalLabel}</strong>{" "}
+                        today for a full {billingCycleLabel} of{" "}
+                        <strong>{upgradePlanIntentLabel(pendingPlanChange.toTier)}</strong>
+                        {" "}with your existing discount applied.
+                      </p>
+                      <p>
+                        Any unused time on your current{" "}
+                        <strong>{upgradePlanIntentLabel(pendingPlanChange.fromTier)}</strong>{" "}
+                        plan will be automatically refunded to your card.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p>
+                        {isDowngrade
+                          ? "You'll receive a prorated credit toward your next billing cycle for the unused time on your current plan."
+                          : "You'll be charged a prorated amount today for the remaining time in your current billing period."}
+                      </p>
+                      {pricingStatus?.account?.subscriptionRenewsAt ? (
+                        <p>
+                          Your subscription will then renew on{" "}
+                          <strong>
+                            {new Date(
+                              pricingStatus.account.subscriptionRenewsAt
+                            ).toLocaleDateString(undefined, {
+                              year: "numeric",
+                              month: "long",
+                              day: "numeric"
+                            })}
+                          </strong>
+                          .
+                        </p>
+                      ) : null}
+                    </>
+                  )}
+                  {planChangeError ? (
+                    <p className="install-progress__error">{planChangeError}</p>
+                  ) : null}
+                  <div className="modal-actions">
+                    <button
+                      className="secondary-button"
+                      disabled={planChangeBusy}
+                      onClick={cancelPlanChange}
+                      type="button"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      className="primary-button"
+                      disabled={planChangeBusy}
+                      onClick={() => void confirmPlanChange()}
+                      type="button"
+                    >
+                      {planChangeBusy
+                        ? isCheckoutFlow
+                          ? "Opening Polar…"
+                          : isDowngrade
+                            ? "Downgrading…"
+                            : "Upgrading…"
+                        : isCheckoutFlow
+                          ? "Continue upgrade"
+                          : `Confirm ${action}`}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })() : null}
 
           {showAppUpdateDialog && appUpdateAvailable ? (
             <div className="modal-backdrop" role="dialog" aria-modal="true">

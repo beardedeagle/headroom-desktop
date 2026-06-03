@@ -1247,6 +1247,17 @@ select {
   color: var(--text-primary);
 }
 
+.upgrade-plan-card__contact-textarea {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  font: inherit;
+  resize: vertical;
+}
+
 .upgrade-plan-card__contact-submit {
   cursor: not-allowed;
   opacity: 0.64;
@@ -1749,6 +1760,63 @@ select {
 .callout-banner__action:disabled {
   cursor: not-allowed;
   opacity: 0.6;
+}
+
+.tier-mismatch-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  border: 1px solid var(--warning);
+  border-radius: 14px;
+  background: var(--warning-tint);
+  color: var(--text-primary);
+}
+
+.tier-mismatch-banner__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.tier-mismatch-banner__title {
+  margin: 0 0 2px;
+  font-size: var(--text-sm);
+  font-weight: 700;
+}
+
+.tier-mismatch-banner__message {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.tier-mismatch-banner__action {
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 12px;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  padding: 6px 12px;
+  color: var(--text-inverse);
+  background: var(--accent-strong);
+  transition: background 120ms ease;
+}
+
+.tier-mismatch-banner__action:hover {
+  background: var(--accent);
+}
+
+.tier-mismatch-banner__action:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.tier-mismatch-banner__error {
+  margin: 6px 0 0;
+  font-size: var(--text-xs);
+  color: var(--danger);
 }
 
 @keyframes callout-dot-pulse {

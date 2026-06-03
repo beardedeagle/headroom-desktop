@@ -420,6 +420,8 @@ export interface HeadroomAccountProfile {
   subscriptionBillingPeriod?: string | null;
   subscriptionDiscountDuration?: string | null;
   subscriptionDiscountDurationInMonths?: number | null;
+  subscriptionCancelAtPeriodEnd?: boolean;
+  subscriptionEndsAt?: string | null;
   inviteCode?: string | null;
   acceptedInvitesCount: number;
   inviteBonusPercent: number;
@@ -442,9 +444,17 @@ export interface HeadroomPricingStatus {
   disableThresholdPercent?: number | null;
   effectiveDisableThresholdPercent?: number | null;
   recommendedSubscriptionTier?: HeadroomSubscriptionTier | null;
+  tierMismatch?: TierMismatch | null;
   claude: ClaudeAccountProfile;
   account?: HeadroomAccountProfile | null;
   launchDiscountActive: boolean;
+}
+
+export interface TierMismatch {
+  paidTier: HeadroomSubscriptionTier;
+  recommendedTier: HeadroomSubscriptionTier;
+  graceEndsAt: string;
+  clamped: boolean;
 }
 
 export interface HeadroomAuthCodeRequest {

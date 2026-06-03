@@ -2,8 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   describeInvokeError,
+  detectSubscriberHasDiscount,
   getNextLowerUpgradePlanId,
+  getPlanCycleTotalLabel,
+  getPlanRenewalPriceLabel,
   getUpgradePlans,
+  isTierDowngrade,
+  standardListPriceCents,
   upgradePlanIntentLabel,
 } from "./appHelpers";
 
@@ -134,6 +139,150 @@ describe("app helpers", () => {
     ]);
   });
 
+  it("shows discounted prices on upgrade-target cards for an active subscriber with the launch discount", () => {
+    const result = getUpgradePlans("individual", "max20x", undefined, "pro", true, true);
+
+    const byId = (id: string) => result.plans.find((plan) => plan.id === id);
+    // Active plan card keeps its full list price (purchaseInfo conveys the real amount).
+    expect(byId("pro")?.price).toBe("$5");
+    expect(byId("pro")?.originalPrice).toBeUndefined();
+    // Upgrade targets show the discounted price with the full price struck through.
+    expect([byId("max5x")?.price, byId("max5x")?.originalPrice]).toEqual(["$10", "$20"]);
+    expect([byId("max20x")?.price, byId("max20x")?.originalPrice]).toEqual(["$20", "$40"]);
+  });
+
+  it("classifies tier direction for plan changes", () => {
+    expect(isTierDowngrade("pro", "max20x")).toBe(false);
+    expect(isTierDowngrade("max20x", "pro")).toBe(true);
+    expect(isTierDowngrade("max5x", "max20x")).toBe(false);
+    expect(isTierDowngrade("max20x", "max5x")).toBe(true);
+  });
+
+  describe("getPlanRenewalPriceLabel", () => {
+    it("returns the standard per-month price when no current paid amount is given", () => {
+      // Max x5 annual is $20 / month (billed annually).
+      expect(getPlanRenewalPriceLabel("max5x", "annual")).toBe("$20 / month");
+      expect(getPlanRenewalPriceLabel("max5x", "monthly")).toBe("$30 / month");
+    });
+
+    it("carries the user's current discount ratio forward to the target plan", () => {
+      // 100% off Pro annual (paid $0 vs $60/year list) -> 100% off Max x20.
+      expect(
+        getPlanRenewalPriceLabel("max20x", "annual", { fromTier: "pro", currentPaidCents: 0 })
+      ).toBe("$0 / month");
+      // 50% off Pro annual (paid $30/year = 3000 cents per cycle vs $60 list)
+      // -> 50% off Max x5 annual: $20 / month list -> $10 / month.
+      expect(
+        getPlanRenewalPriceLabel("max5x", "annual", { fromTier: "pro", currentPaidCents: 3000 })
+      ).toBe("$10 / month");
+      // 50% off monthly cycle (paid $3.75 vs $7.50 list per month) -> 50% off Max x5
+      // monthly: $30 / month list -> $15 / month.
+      expect(
+        getPlanRenewalPriceLabel("max5x", "monthly", { fromTier: "pro", currentPaidCents: 375 })
+      ).toBe("$15 / month");
+    });
+  });
+
+  describe("getPlanCycleTotalLabel", () => {
+    it("returns the full-cycle total for the target plan", () => {
+      // Max x5 annual is $20 / month -> $240 charged once a year.
+      expect(getPlanCycleTotalLabel("max5x", "annual")).toBe("$240");
+      // Max x5 monthly is $30 / month -> $30 per monthly cycle.
+      expect(getPlanCycleTotalLabel("max5x", "monthly")).toBe("$30");
+    });
+
+    it("carries the user's current discount ratio into the cycle total", () => {
+      // 100%-off Pro annual ($0 paid) -> $0 for a full year of Max x20.
+      expect(
+        getPlanCycleTotalLabel("max20x", "annual", { fromTier: "pro", currentPaidCents: 0 })
+      ).toBe("$0");
+      // 50%-off Pro annual (paid $30/year of $60 list) -> half of Max x5
+      // annual: $240 list -> $120 total today.
+      expect(
+        getPlanCycleTotalLabel("max5x", "annual", { fromTier: "pro", currentPaidCents: 3000 })
+      ).toBe("$120");
+    });
+  });
+
+  describe("standardListPriceCents", () => {
+    it("returns the full-cycle list price in cents", () => {
+      // Pro annual: $5 / month list -> $60 / year.
+      expect(standardListPriceCents("pro", "annual")).toBe(6000);
+      // Max x5 annual: $20 / month list -> $240 / year.
+      expect(standardListPriceCents("max5x", "annual")).toBe(24000);
+      // Max x20 monthly: $60 / month list -> $60 / month.
+      expect(standardListPriceCents("max20x", "monthly")).toBe(6000);
+    });
+  });
+
+  describe("detectSubscriberHasDiscount", () => {
+    it("returns true when a discount duration is present", () => {
+      expect(
+        detectSubscriberHasDiscount({ subscriptionDiscountDuration: "forever" })
+      ).toBe(true);
+      // 'once' counts too; we route to checkout to avoid the proration trap.
+      expect(
+        detectSubscriberHasDiscount({ subscriptionDiscountDuration: "once" })
+      ).toBe(true);
+    });
+
+    it("falls back to launch-discount + below-list when sync shows no discount", () => {
+      // The exhausted-'once' state: discount duration is null but the user
+      // pays below list and the launch promo is still globally active.
+      expect(
+        detectSubscriberHasDiscount({
+          subscriptionDiscountDuration: null,
+          launchDiscountActive: true,
+          currentTier: "max5x",
+          currentBillingPeriod: "annual",
+          // List for Max x5 annual is $240 / 24000. They're at $0 -> discounted.
+          subscriptionAmountCents: 0
+        })
+      ).toBe(true);
+      // Same user but paying full list price -> no discount.
+      expect(
+        detectSubscriberHasDiscount({
+          subscriptionDiscountDuration: null,
+          launchDiscountActive: true,
+          currentTier: "max5x",
+          currentBillingPeriod: "annual",
+          subscriptionAmountCents: 24000
+        })
+      ).toBe(false);
+    });
+
+    it("returns false when launch discount is inactive even if user pays below list", () => {
+      expect(
+        detectSubscriberHasDiscount({
+          subscriptionDiscountDuration: null,
+          launchDiscountActive: false,
+          currentTier: "pro",
+          currentBillingPeriod: "annual",
+          subscriptionAmountCents: 0
+        })
+      ).toBe(false);
+    });
+
+    it("returns false when the amount or tier is unknown", () => {
+      expect(
+        detectSubscriberHasDiscount({
+          launchDiscountActive: true,
+          currentTier: null,
+          currentBillingPeriod: "annual",
+          subscriptionAmountCents: 0
+        })
+      ).toBe(false);
+      expect(
+        detectSubscriberHasDiscount({
+          launchDiscountActive: true,
+          currentTier: "pro",
+          currentBillingPeriod: "annual",
+          subscriptionAmountCents: null
+        })
+      ).toBe(false);
+    });
+  });
+
   describe("active plan purchase info", () => {
     const baseArgs = [
       "individual" as const,
@@ -213,6 +362,78 @@ describe("app helpers", () => {
         paidPerMonthLabel: "$5",
         discountPct: 0,
       });
+    });
+  });
+
+  describe("scheduled downgrade", () => {
+    const baseArgs = [
+      "individual" as const,
+      undefined,
+      undefined,
+      "max20x" as const,
+      true,
+      false,
+      "annual" as const,
+    ] as const;
+
+    function planById(result: ReturnType<typeof getUpgradePlans>, id: string) {
+      return result.plans.find((p) => p.id === id);
+    }
+
+    it("stamps cancel info on the active plan card when downgrade is scheduled", () => {
+      const result = getUpgradePlans(
+        ...baseArgs,
+        12000, // $10/mo annual
+        "annual",
+        "2027-03-31",
+        "2026-03-31",
+        null,
+        null,
+        true,
+        "2027-03-31T20:31:45Z"
+      );
+      const active = planById(result, "max20x");
+      expect(active?.purchaseInfo?.cancelAtPeriodEnd).toBe(true);
+      expect(active?.purchaseInfo?.endsOn).toBeDefined();
+    });
+
+    it("stamps the free plan with the activation date and downgrade-scheduled CTA", () => {
+      const result = getUpgradePlans(
+        ...baseArgs,
+        12000,
+        "annual",
+        "2027-03-31",
+        "2026-03-31",
+        null,
+        null,
+        true,
+        "2027-03-31T20:31:45Z"
+      );
+      const free = planById(result, "free");
+      expect(free?.ctaLabel).toBe("Downgrade scheduled");
+      expect(free?.purchaseInfo?.cancelAtPeriodEnd).toBe(true);
+      expect(free?.purchaseInfo?.endsOn).toBeDefined();
+    });
+
+    it("leaves both cards untouched when no downgrade is scheduled", () => {
+      const result = getUpgradePlans(
+        ...baseArgs,
+        12000,
+        "annual",
+        "2027-03-31",
+        "2026-03-31",
+        null,
+        null,
+        false,
+        null
+      );
+      const free = planById(result, "free");
+      const active = planById(result, "max20x");
+      // On Max x20, the Free card's natural relative-CTA is "Downgrade to Free plan".
+      expect(free?.ctaLabel).toBe("Downgrade to Free plan");
+      expect(free?.purchaseInfo).toBeUndefined();
+      expect(active?.purchaseInfo?.cancelAtPeriodEnd).toBe(false);
+      expect(active?.purchaseInfo?.endsOn).toBeUndefined();
     });
   });
 });
