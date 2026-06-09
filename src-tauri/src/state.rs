@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -22,7 +22,7 @@ use crate::insights::generate_daily_insights;
 use crate::models::{
     ActivityEvent, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus,
     DailyInsight, DailySavingsPoint, DashboardState, HeadroomLearnPrereqStatus,
-    HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience, OptimizationMode, RtkRuntimeStatus,
+    HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus,
     RuntimeStatus, RuntimeUpgradeFailure, RuntimeUpgradeProgress, TransformationFeedEvent,
     UpgradeFailurePhase, UsageEvent,
 };
@@ -452,12 +452,6 @@ pub struct AppState {
     launch_profile_path: std::path::PathBuf,
     last_known_good_plan: Mutex<Option<LastKnownGoodPlan>>,
     last_known_good_plan_path: std::path::PathBuf,
-    /// Effective backend optimization mode (`HEADROOM_MODE`), as an
-    /// `OptimizationMode` packed into a u8. Read lock-free when spawning the
-    /// backend; updated by the auth-detection worker via
-    /// `set_optimization_mode_and_restart`.
-    optimization_mode_cell: Arc<AtomicU8>,
-    optimization_mode_path: std::path::PathBuf,
     savings_tracker: Mutex<SavingsTracker>,
     activity_facts: Mutex<ActivityFacts>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
@@ -524,8 +518,6 @@ impl AppState {
         let tool_manager = ToolManager::new(runtime);
         let (launch_profile, launch_profile_path) = LaunchProfile::load_or_create(&base_dir)?;
         let (last_known_good_plan, last_known_good_plan_path) = LastKnownGoodPlan::load(&base_dir);
-        let (persisted_mode, optimization_mode_path) = PersistedOptimizationMode::load(&base_dir);
-        let initial_mode = persisted_mode.map(|p| p.mode).unwrap_or_default();
         let savings_tracker = SavingsTracker::load_or_create(&base_dir)?;
         let activity_facts = ActivityFacts::load_or_create(&base_dir)?;
 
@@ -575,8 +567,6 @@ impl AppState {
             launch_profile_path,
             last_known_good_plan: Mutex::new(last_known_good_plan),
             last_known_good_plan_path,
-            optimization_mode_cell: Arc::new(AtomicU8::new(initial_mode.as_u8())),
-            optimization_mode_path,
             savings_tracker: Mutex::new(savings_tracker),
             activity_facts: Mutex::new(activity_facts),
             cached_clients: Mutex::new(None),
@@ -2460,9 +2450,7 @@ impl AppState {
         } // release lock before the blocking start
 
         self.set_runtime_starting(true);
-        let started = self
-            .tool_manager
-            .start_headroom_background(self.optimization_mode());
+        let started = self.tool_manager.start_headroom_background();
         self.set_runtime_starting(false);
 
         match started {
@@ -2598,48 +2586,6 @@ impl AppState {
 
     pub fn runtime_is_starting(&self) -> bool {
         *self.runtime_starting.lock()
-    }
-
-    /// Current effective backend optimization mode.
-    pub fn optimization_mode(&self) -> OptimizationMode {
-        OptimizationMode::from_u8(
-            self.optimization_mode_cell
-                .load(std::sync::atomic::Ordering::Acquire),
-        )
-    }
-
-    /// Switch the backend optimization mode and restart the proxy so it
-    /// re-reads `HEADROOM_MODE`. No-op when the mode is unchanged. Skips the
-    /// restart when the proxy is intentionally down (pricing bypass or a
-    /// user-paused runtime) — the new mode is still persisted and takes effect
-    /// the next time the backend comes up.
-    pub fn set_optimization_mode_and_restart(&self, mode: OptimizationMode) -> Result<()> {
-        if self.optimization_mode() == mode {
-            return Ok(());
-        }
-        self.optimization_mode_cell
-            .store(mode.as_u8(), std::sync::atomic::Ordering::Release);
-        persist_optimization_mode(
-            &self.optimization_mode_path,
-            &PersistedOptimizationMode {
-                mode,
-                source: "detected".into(),
-                recorded_at: Utc::now(),
-            },
-        );
-        log::info!(
-            "optimization mode -> {} (auto-detected); restarting backend",
-            mode.as_env_str()
-        );
-
-        let bypassed = self
-            .proxy_bypass
-            .load(std::sync::atomic::Ordering::Acquire);
-        if bypassed || self.runtime_is_paused() {
-            return Ok(());
-        }
-        self.stop_headroom();
-        self.ensure_headroom_running()
     }
 
     pub fn resume_runtime(&self) -> Result<()> {
@@ -3110,37 +3056,6 @@ impl LastKnownGoodPlan {
 
 fn persist_last_known_good_plan(path: &std::path::Path, plan: &LastKnownGoodPlan) {
     if let Ok(bytes) = serde_json::to_vec_pretty(plan) {
-        let _ = std::fs::write(path, bytes);
-    }
-}
-
-/// Persisted backend optimization mode. Loaded at startup so a known API-key
-/// user starts in `token` mode immediately instead of running `cache` until
-/// the intercept re-detects the auth class. `source` records whether the value
-/// was auto-detected or is the shipped default.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedOptimizationMode {
-    mode: OptimizationMode,
-    source: String,
-    recorded_at: DateTime<Utc>,
-}
-
-impl PersistedOptimizationMode {
-    fn load(base_dir: &std::path::Path) -> (Option<Self>, std::path::PathBuf) {
-        let path = config_file(base_dir, "optimization-mode.json");
-        let value = if path.exists() {
-            std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
-        } else {
-            None
-        };
-        (value, path)
-    }
-}
-
-fn persist_optimization_mode(path: &std::path::Path, entry: &PersistedOptimizationMode) {
-    if let Ok(bytes) = serde_json::to_vec_pretty(entry) {
         let _ = std::fs::write(path, bytes);
     }
 }
@@ -5464,34 +5379,6 @@ mod tests {
     }
 
     #[test]
-    fn optimization_mode_persists_and_defaults() {
-        use crate::models::OptimizationMode;
-        let id = uuid::Uuid::new_v4();
-        let base = std::env::temp_dir().join(format!("headroom-optmode-test-{}", id));
-
-        // Absent file -> no persisted mode (caller falls back to default cache).
-        let (loaded, path) = super::PersistedOptimizationMode::load(&base);
-        assert!(loaded.is_none());
-        assert_eq!(OptimizationMode::default(), OptimizationMode::Cache);
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create config dir");
-        }
-        super::persist_optimization_mode(
-            &path,
-            &super::PersistedOptimizationMode {
-                mode: OptimizationMode::Token,
-                source: "detected".into(),
-                recorded_at: Utc::now(),
-            },
-        );
-
-        let (reloaded, _) = super::PersistedOptimizationMode::load(&base);
-        assert_eq!(reloaded.map(|entry| entry.mode), Some(OptimizationMode::Token));
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
     fn persist_launch_profile_round_trips_new_fields() {
         let id = uuid::Uuid::new_v4();
         let path = std::env::temp_dir().join(format!("headroom-launch-profile-test-{}.json", id));
@@ -5837,6 +5724,7 @@ mod tests {
                 extra_usage_monthly_limit: None,
                 profile_fetch_error: None,
             },
+            codex: None,
             account: None,
             launch_discount_active: false,
         }

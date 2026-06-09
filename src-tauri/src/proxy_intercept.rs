@@ -47,103 +47,8 @@ pub type BypassFlag = Arc<AtomicBool>;
 /// directly. Cloned per-connection in `run`.
 pub type FreshBearerNotifier = mpsc::Sender<()>;
 
-/// How a request passing through the intercept authenticated with Anthropic.
-/// Used by the auth-detection worker to choose the backend optimization mode:
-/// API-key traffic pays per raw token (token mode), subscription/OAuth traffic
-/// is billed on the cache-weighted meter (cache mode).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthClass {
-    /// `x-api-key:` header present — pay-as-you-go API key.
-    ApiKey,
-    /// `Authorization: Bearer ...` with no API key — Claude AI OAuth / subscription.
-    Subscription,
-}
-
-/// Channel sender used to report each request's classified [`AuthClass`] to the
-/// background decision worker. Cloned per-connection in `run`.
-pub type AuthClassNotifier = mpsc::Sender<AuthClass>;
-
-/// Classify how a request authenticated, from its raw header block. Returns
-/// `None` for requests carrying neither recognizable credential (e.g. Bedrock /
-/// Vertex / unauthenticated probes), which should leave the current mode alone.
-///
-/// Precedence: an `x-api-key` header means API-key mode regardless of anything
-/// else (subscription traffic never sends one); otherwise a non-empty
-/// `Authorization: Bearer` is subscription/OAuth.
-pub fn classify_request_auth(header_buf: &[u8]) -> Option<AuthClass> {
-    let text = std::str::from_utf8(header_buf).ok()?;
-    let mut has_api_key = false;
-    let mut has_bearer = false;
-    for line in text.split("\r\n") {
-        let Some(colon) = line.find(':') else {
-            continue;
-        };
-        let name = line[..colon].trim().to_ascii_lowercase();
-        let value = line[colon + 1..].trim();
-        match name.as_str() {
-            "x-api-key" => {
-                if !value.is_empty() {
-                    has_api_key = true;
-                }
-            }
-            "authorization" => {
-                let lower = value.to_ascii_lowercase();
-                if let Some(rest) = lower.strip_prefix("bearer ") {
-                    if !rest.trim().is_empty() {
-                        has_bearer = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if has_api_key {
-        Some(AuthClass::ApiKey)
-    } else if has_bearer {
-        Some(AuthClass::Subscription)
-    } else {
-        None
-    }
-}
-
-/// Streak-based hysteresis over per-request [`AuthClass`] observations. The
-/// decision worker only acts once the same class has been seen `threshold`
-/// times in a row, so a single odd request (or genuinely mixed traffic, which
-/// keeps resetting the streak) never flips the backend mode.
-pub struct AuthModeHysteresis {
-    threshold: u32,
-    streak_class: Option<AuthClass>,
-    streak_count: u32,
-}
-
-impl AuthModeHysteresis {
-    pub fn new(threshold: u32) -> Self {
-        Self {
-            threshold: threshold.max(1),
-            streak_class: None,
-            streak_count: 0,
-        }
-    }
-
-    /// Record one observation. Returns the class once it is "confirmed" — i.e.
-    /// the current same-class streak has reached `threshold` (and on every
-    /// observation past it, so a switch the worker had to defer can retry).
-    pub fn observe(&mut self, class: AuthClass) -> Option<AuthClass> {
-        if self.streak_class == Some(class) {
-            self.streak_count = self.streak_count.saturating_add(1);
-        } else {
-            self.streak_class = Some(class);
-            self.streak_count = 1;
-        }
-        if self.streak_count >= self.threshold {
-            Some(class)
-        } else {
-            None
-        }
-    }
-}
-
 pub const ANTHROPIC_DIRECT_BASE: &str = "https://api.anthropic.com";
+pub const OPENAI_DIRECT_BASE: &str = "https://api.openai.com";
 
 /// Spawn the intercept proxy as a background Tokio task.
 /// Returns immediately; the server runs until the process exits.
@@ -153,7 +58,6 @@ pub fn spawn(
     token_slot: SharedToken,
     bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
-    auth_tx: AuthClassNotifier,
 ) {
     let upstream_base = Arc::new(ANTHROPIC_DIRECT_BASE.to_string());
     std::thread::Builder::new()
@@ -170,7 +74,6 @@ pub fn spawn(
                     token_slot,
                     bypass,
                     fresh_bearer_tx,
-                    auth_tx,
                     upstream_base,
                 )
                 .await
@@ -217,7 +120,6 @@ async fn run(
     token_slot: SharedToken,
     bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
-    auth_tx: AuthClassNotifier,
     upstream_base: Arc<String>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
@@ -229,8 +131,7 @@ async fn run(
                 let bypass = bypass.clone();
                 let upstream_base = upstream_base.clone();
                 let tx = fresh_bearer_tx.clone();
-                let auth_tx = auth_tx.clone();
-                tokio::spawn(handle(client, slot, bypass, tx, auth_tx, upstream_base));
+                tokio::spawn(handle(client, slot, bypass, tx, upstream_base));
             }
             Err(e) => {
                 // EMFILE/ENFILE/ECONNABORTED are transient — log and keep serving
@@ -259,7 +160,6 @@ async fn handle(
     token_slot: SharedToken,
     bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
-    auth_tx: AuthClassNotifier,
     upstream_base: Arc<String>,
 ) {
     // Re-read the backend port on each connection. `tool_manager` selects the
@@ -305,13 +205,6 @@ async fn handle(
         if changed {
             let _ = fresh_bearer_tx.send(());
         }
-    }
-
-    // Report how this request authenticated so the decision worker can pick
-    // the backend optimization mode (API key -> token, subscription -> cache).
-    // Non-blocking; ignored if the receiver has gone away.
-    if let Some(class) = classify_request_auth(&buf) {
-        let _ = auth_tx.send(class);
     }
 
     // When the pricing gate has bypassed Headroom, the Python proxy on
@@ -390,6 +283,17 @@ async fn forward_direct_to_anthropic(
         return;
     }
 
+    // Codex points OPENAI_BASE_URL at this intercept proxy, so in bypass mode
+    // OpenAI traffic (e.g. /v1/responses) lands here too. Codex billing is
+    // OpenAI's, separate from Headroom's Claude account gate, so don't break
+    // Codex when the gate trips — forward OpenAI paths to OpenAI directly
+    // rather than (wrongly) to api.anthropic.com.
+    let effective_base: &str = if is_openai_path(&parsed.path) {
+        OPENAI_DIRECT_BASE
+    } else {
+        upstream_base
+    };
+
     let body = match parsed.content_length {
         Some(total) if total > leftover_body.len() => {
             let mut body = Vec::with_capacity(total);
@@ -405,7 +309,7 @@ async fn forward_direct_to_anthropic(
         None => leftover_body.to_vec(),
     };
 
-    let url = format!("{}{}", upstream_base, parsed.path);
+    let url = format!("{}{}", effective_base, parsed.path);
     let method = match reqwest::Method::from_bytes(parsed.method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
@@ -633,6 +537,22 @@ fn is_local_proxy_path(path: &str) -> bool {
     })
 }
 
+/// OpenAI-specific API paths used by the Codex CLI. These have no Anthropic
+/// counterpart (Claude uses `/v1/messages` / `/v1/complete`), so matching by
+/// path is unambiguous and lets bypass-mode forward Codex traffic to OpenAI.
+fn is_openai_path(path: &str) -> bool {
+    const OPENAI_PREFIXES: &[&str] = &[
+        "/v1/responses",
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/embeddings",
+    ];
+    OPENAI_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/') || rest.starts_with('?'))
+    })
+}
+
 /// Return true if the request's Host header targets the loopback listener
 /// and no browser Origin header is present. Protects against DNS-rebinding
 /// attacks that aim the user's browser at 127.0.0.1 via an attacker domain.
@@ -690,10 +610,9 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value_changed, classify_request_auth, extract_bearer, find_header_end,
-        is_hop_by_hop_request_header, is_hop_by_hop_response_header, parse_request_head,
-        read_http_headers, request_is_loopback_safe, run, AuthClass, AuthModeHysteresis, BypassFlag,
-        SharedToken,
+        bearer_value_changed, extract_bearer, find_header_end, is_hop_by_hop_request_header,
+        is_hop_by_hop_response_header, is_local_proxy_path, is_openai_path, parse_request_head,
+        read_http_headers, request_is_loopback_safe, run, BypassFlag, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -713,69 +632,22 @@ mod tests {
     }
 
     #[test]
-    fn classify_auth_x_api_key_is_apikey() {
-        let req = b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-api-key: sk-ant-api03-abc\r\n\r\n";
-        assert_eq!(classify_request_auth(req), Some(AuthClass::ApiKey));
-    }
-
-    #[test]
-    fn classify_auth_bearer_oauth_is_subscription() {
-        let req = b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer sk-ant-oat01-xyz\r\nanthropic-beta: oauth-2025-04-20\r\n\r\n";
-        assert_eq!(classify_request_auth(req), Some(AuthClass::Subscription));
-    }
-
-    #[test]
-    fn classify_auth_api_key_wins_over_bearer() {
-        // Subscription clients never send x-api-key; if both appear, the API
-        // key is authoritative.
-        let req = b"POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer sk-ant-oat01-xyz\r\nx-api-key: sk-ant-api03-abc\r\n\r\n";
-        assert_eq!(classify_request_auth(req), Some(AuthClass::ApiKey));
-    }
-
-    #[test]
-    fn classify_auth_header_name_is_case_insensitive() {
-        let req = b"POST /v1/messages HTTP/1.1\r\nX-API-Key: sk-ant-api03-abc\r\n\r\n";
-        assert_eq!(classify_request_auth(req), Some(AuthClass::ApiKey));
-    }
-
-    #[test]
-    fn classify_auth_none_when_no_credentials() {
-        let req = b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n";
-        assert_eq!(classify_request_auth(req), None);
-        // Empty values do not count.
-        let empty = b"POST /v1/messages HTTP/1.1\r\nx-api-key: \r\nAuthorization: Bearer \r\n\r\n";
-        assert_eq!(classify_request_auth(empty), None);
-    }
-
-    #[test]
-    fn hysteresis_requires_consecutive_streak() {
-        let mut h = AuthModeHysteresis::new(3);
-        assert_eq!(h.observe(AuthClass::ApiKey), None);
-        assert_eq!(h.observe(AuthClass::ApiKey), None);
-        // Third consecutive confirms.
-        assert_eq!(h.observe(AuthClass::ApiKey), Some(AuthClass::ApiKey));
-        // Past threshold keeps confirming so a deferred switch can retry.
-        assert_eq!(h.observe(AuthClass::ApiKey), Some(AuthClass::ApiKey));
-    }
-
-    #[test]
-    fn hysteresis_mixed_traffic_never_confirms() {
-        let mut h = AuthModeHysteresis::new(3);
-        for _ in 0..10 {
-            assert_eq!(h.observe(AuthClass::ApiKey), None);
-            assert_eq!(h.observe(AuthClass::Subscription), None);
-        }
-    }
-
-    #[test]
-    fn hysteresis_contradicting_class_resets_streak() {
-        let mut h = AuthModeHysteresis::new(3);
-        assert_eq!(h.observe(AuthClass::ApiKey), None);
-        assert_eq!(h.observe(AuthClass::ApiKey), None);
-        // Different class resets the streak.
-        assert_eq!(h.observe(AuthClass::Subscription), None);
-        assert_eq!(h.observe(AuthClass::Subscription), None);
-        assert_eq!(h.observe(AuthClass::Subscription), Some(AuthClass::Subscription));
+    fn openai_paths_route_to_openai_in_bypass() {
+        // Codex's Responses API and the OpenAI chat/completions family must be
+        // recognized as OpenAI traffic so bypass mode forwards them to OpenAI,
+        // not api.anthropic.com.
+        assert!(is_openai_path("/v1/responses"));
+        assert!(is_openai_path("/v1/responses/abc?stream=true"));
+        assert!(is_openai_path("/v1/chat/completions"));
+        assert!(is_openai_path("/v1/completions"));
+        assert!(is_openai_path("/v1/embeddings"));
+        // Anthropic paths must NOT be misrouted to OpenAI.
+        assert!(!is_openai_path("/v1/messages"));
+        assert!(!is_openai_path("/v1/complete"));
+        assert!(!is_openai_path("/v1/models"));
+        // Codex's own usage tracker endpoints stay local.
+        assert!(is_local_proxy_path("/stats"));
+        assert!(!is_openai_path("/stats"));
     }
 
     #[test]
@@ -915,7 +787,6 @@ mod tests {
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
         let upstream_base = Arc::new("https://api.anthropic.com".to_string());
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
-        let (auth_tx, _auth_rx) = std::sync::mpsc::channel::<AuthClass>();
         let run_task = tokio::spawn(async move {
             // run() loops forever; the test cancels it via abort below.
             let _ = run(
@@ -923,7 +794,6 @@ mod tests {
                 slot_for_run,
                 bypass_for_run,
                 fresh_bearer_tx,
-                auth_tx,
                 upstream_base,
             )
             .await;
@@ -999,14 +869,12 @@ mod tests {
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
         let upstream_base = Arc::new("https://api.anthropic.com".to_string());
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
-        let (auth_tx, _auth_rx) = std::sync::mpsc::channel::<AuthClass>();
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
                 slot_for_run,
                 bypass_for_run,
                 fresh_bearer_tx,
-                auth_tx,
                 upstream_base,
             )
             .await;
@@ -1203,14 +1071,12 @@ mod tests {
         let upstream_base_arc = Arc::new(upstream_base);
         let token_for_run = token_slot.clone();
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
-        let (auth_tx, _auth_rx) = std::sync::mpsc::channel::<AuthClass>();
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
                 token_for_run,
                 bypass,
                 fresh_bearer_tx,
-                auth_tx,
                 upstream_base_arc,
             )
             .await;
@@ -1343,14 +1209,12 @@ mod tests {
         backend_port::set(1);
         let upstream_base_arc = Arc::new(upstream_base);
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
-        let (auth_tx, _auth_rx) = std::sync::mpsc::channel::<AuthClass>();
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
                 token_slot,
                 bypass,
                 fresh_bearer_tx,
-                auth_tx,
                 upstream_base_arc,
             )
             .await;
@@ -1435,14 +1299,12 @@ mod tests {
         let upstream_base = Arc::new("https://api.anthropic.com".to_string());
         let token_for_run = token_slot.clone();
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
-        let (auth_tx, _auth_rx) = std::sync::mpsc::channel::<AuthClass>();
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
                 token_for_run,
                 bypass_for_run,
                 fresh_bearer_tx,
-                auth_tx,
                 upstream_base,
             )
             .await;

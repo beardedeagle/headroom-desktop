@@ -2440,9 +2440,7 @@ fn apply_client_setup(app: AppHandle, client_id: String) -> Result<ClientSetupRe
         }
         Err(err) => {
             let msg = err.to_string();
-            if !msg.starts_with("Automatic setup is not supported yet")
-                && !msg.starts_with("Codex integration has been disabled")
-            {
+            if !msg.starts_with("Automatic setup is not supported yet") {
                 sentry::capture_message(
                     &format!("client setup failed for {client_id}: {err:#}"),
                     sentry::Level::Error,
@@ -2731,79 +2729,11 @@ pub fn run() {
                 })
                 .expect("spawn identity pusher");
 
-            // Auth-mode detector: the intercept reports how each request
-            // authenticated; we switch the backend optimization mode to match.
-            // API-key traffic pays per raw token (token mode); subscription /
-            // OAuth traffic is billed on the cache-weighted meter (cache mode).
-            // Hysteresis (N consecutive same-class observations) + a debounce
-            // interval prevent flapping; ambiguous/mixed traffic never reaches
-            // the threshold and stays on the safe `cache` default.
-            let (auth_tx, auth_rx) = std::sync::mpsc::channel::<proxy_intercept::AuthClass>();
-            let app_handle_for_mode = app.handle().clone();
-            std::thread::Builder::new()
-                .name("auth-mode-detector".into())
-                .spawn(move || {
-                    use crate::models::OptimizationMode;
-                    use proxy_intercept::{AuthClass, AuthModeHysteresis};
-                    const CONFIRM_THRESHOLD: u32 = 5;
-                    const MIN_SWITCH_INTERVAL: std::time::Duration =
-                        std::time::Duration::from_secs(120);
-
-                    let mut hysteresis = AuthModeHysteresis::new(CONFIRM_THRESHOLD);
-                    let mut last_switch: Option<std::time::Instant> = None;
-
-                    while let Ok(class) = auth_rx.recv() {
-                        let Some(class) = hysteresis.observe(class) else {
-                            continue;
-                        };
-                        let desired = match class {
-                            AuthClass::ApiKey => OptimizationMode::Token,
-                            AuthClass::Subscription => OptimizationMode::Cache,
-                        };
-                        if let Some(prev) = last_switch {
-                            if prev.elapsed() < MIN_SWITCH_INTERVAL {
-                                continue;
-                            }
-                        }
-                        let app_handle = app_handle_for_mode.clone();
-                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            move || -> bool {
-                                let state: tauri::State<'_, AppState> = app_handle.state();
-                                if state.optimization_mode() == desired {
-                                    return false;
-                                }
-                                match state.set_optimization_mode_and_restart(desired) {
-                                    Ok(()) => true,
-                                    Err(err) => {
-                                        log::warn!(
-                                            "auth-mode-detector: mode switch failed: {err:#}"
-                                        );
-                                        false
-                                    }
-                                }
-                            },
-                        ));
-                        match outcome {
-                            Ok(true) => last_switch = Some(std::time::Instant::now()),
-                            Ok(false) => {}
-                            Err(_) => {
-                                log::error!("auth-mode-detector worker panicked");
-                                sentry::capture_message(
-                                    "auth-mode-detector worker panicked",
-                                    sentry::Level::Error,
-                                );
-                            }
-                        }
-                    }
-                })
-                .expect("spawn auth mode detector");
-
             // Start the intercept layer before anything else touches port 6767.
             proxy_intercept::spawn(
                 std::sync::Arc::clone(&state.claude_bearer_token),
                 std::sync::Arc::clone(&state.proxy_bypass),
                 fresh_bearer_tx,
-                auth_tx,
             );
             if state.should_present_on_launch() && !launched_from_autostart {
                 let _ = show_launcher_window(app.handle());

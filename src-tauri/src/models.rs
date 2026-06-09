@@ -588,43 +588,6 @@ pub enum ClaudePlanTier {
     Unknown,
 }
 
-/// Backend optimization mode passed to the managed headroom proxy via the
-/// `HEADROOM_MODE` env var. `Cache` keeps Anthropic's prefix cache stable
-/// (correct for subscription/OAuth traffic billed on the cache-weighted
-/// meter); `Token` rewrites prior turns for maximum raw-token savings
-/// (correct for pay-per-token API keys). Stored in an `AtomicU8` for
-/// lock-free reads at spawn time, hence `as_u8`/`from_u8`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum OptimizationMode {
-    #[default]
-    Cache,
-    Token,
-}
-
-impl OptimizationMode {
-    pub fn as_env_str(self) -> &'static str {
-        match self {
-            OptimizationMode::Cache => "cache",
-            OptimizationMode::Token => "token",
-        }
-    }
-
-    pub fn as_u8(self) -> u8 {
-        match self {
-            OptimizationMode::Cache => 0,
-            OptimizationMode::Token => 1,
-        }
-    }
-
-    pub fn from_u8(value: u8) -> Self {
-        match value {
-            1 => OptimizationMode::Token,
-            _ => OptimizationMode::Cache,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeadroomSubscriptionTier {
@@ -694,6 +657,36 @@ pub struct ClaudeAccountProfile {
     pub profile_fetch_error: Option<String>,
 }
 
+/// A single Codex (OpenAI) rate-limit window, parsed from the backend `/stats`
+/// `codex_rate_limits` block (itself sourced from `x-codex-*` response headers).
+/// Windows are labeled dynamically by the upstream server (e.g. "5h", "7d"), so
+/// the label is carried verbatim rather than assumed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsageWindow {
+    pub used_percent: f64,
+    pub window_label: Option<String>,
+    pub window_minutes: Option<i64>,
+    pub seconds_until_reset: Option<i64>,
+}
+
+/// Codex subscription usage surfaced alongside the Claude profile in the pricing
+/// status. Present only when the Codex connector is enabled and at least one
+/// Codex response with rate-limit headers has flowed through the proxy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsage {
+    pub limit_name: Option<String>,
+    pub primary: Option<CodexUsageWindow>,
+    pub secondary: Option<CodexUsageWindow>,
+    pub credits_balance: Option<String>,
+    pub credits_unlimited: bool,
+    /// True once primary usage crosses the soft nudge threshold.
+    pub should_nudge: bool,
+    /// Display copy for the codex usage state (active / nudging / near-limit).
+    pub gate_message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeadroomAccountProfile {
@@ -739,6 +732,10 @@ pub struct HeadroomPricingStatus {
     pub recommended_subscription_tier: Option<HeadroomSubscriptionTier>,
     pub tier_mismatch: Option<TierMismatch>,
     pub claude: ClaudeAccountProfile,
+    /// Codex subscription usage, populated only when the Codex connector is
+    /// enabled and the backend has captured at least one rate-limit snapshot.
+    #[serde(default)]
+    pub codex: Option<CodexUsage>,
     pub account: Option<HeadroomAccountProfile>,
     pub launch_discount_active: bool,
 }
@@ -762,34 +759,3 @@ pub struct HeadroomAuthCodeRequest {
     pub expires_in_seconds: u64,
 }
 
-#[cfg(test)]
-mod optimization_mode_tests {
-    use super::OptimizationMode;
-
-    #[test]
-    fn u8_round_trip_and_default() {
-        assert_eq!(OptimizationMode::default(), OptimizationMode::Cache);
-        assert_eq!(OptimizationMode::Cache.as_u8(), 0);
-        assert_eq!(OptimizationMode::Token.as_u8(), 1);
-        assert_eq!(OptimizationMode::from_u8(0), OptimizationMode::Cache);
-        assert_eq!(OptimizationMode::from_u8(1), OptimizationMode::Token);
-        // Unknown bytes fall back to the safe cache mode.
-        assert_eq!(OptimizationMode::from_u8(99), OptimizationMode::Cache);
-    }
-
-    #[test]
-    fn env_str_matches_backend() {
-        assert_eq!(OptimizationMode::Cache.as_env_str(), "cache");
-        assert_eq!(OptimizationMode::Token.as_env_str(), "token");
-    }
-
-    #[test]
-    fn serde_is_lowercase() {
-        assert_eq!(
-            serde_json::to_string(&OptimizationMode::Token).unwrap(),
-            "\"token\""
-        );
-        let parsed: OptimizationMode = serde_json::from_str("\"cache\"").unwrap();
-        assert_eq!(parsed, OptimizationMode::Cache);
-    }
-}

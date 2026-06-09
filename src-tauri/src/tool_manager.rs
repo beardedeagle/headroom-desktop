@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tar::Archive;
 
 use crate::backend_port::{self, AllForeign, SelectedFallback};
-use crate::models::{ManagedTool, OptimizationMode, RtkTodayStats, ToolStatus};
+use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
@@ -457,7 +457,7 @@ impl ToolManager {
         }
     }
 
-    pub fn start_headroom_background(&self, mode: OptimizationMode) -> Result<Child> {
+    pub fn start_headroom_background(&self) -> Result<Child> {
         let mut allow_repair = true;
         'attempt: loop {
             let python = self.managed_python();
@@ -612,13 +612,11 @@ impl ToolManager {
                     .env("HF_HUB_DISABLE_XET", "1")
                     .env("HEADROOM_SDK", "headroom-desktop-proxy")
                     .env("HEADROOM_HTTP2", "false")
-                    // Optimization mode. Defaults to cache (prefix-stable) because
-                    // desktop traffic is overwhelmingly Claude Code (subscription/OAuth),
-                    // billed on the cache-weighted meter where token mode's prior-turn
-                    // rewrites bust the prefix cache and inflate usage. The intercept
-                    // flips this to `token` when it detects pay-per-token API-key traffic
-                    // (see AppState::set_optimization_mode_and_restart).
-                    .env("HEADROOM_MODE", mode.as_env_str())
+                    // Optimization mode. Always token: maximize raw-token savings via
+                    // prior-turn compression. (Cache mode and the auth-based auto-switch
+                    // were removed; cache mode contributed no measurable savings over
+                    // Claude Code's native prefix caching.)
+                    .env("HEADROOM_MODE", "token")
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(
                         log_file
