@@ -2288,7 +2288,7 @@ export default function App() {
     }
   }
 
-  async function autoConfigureClaudeCodeForLauncher() {
+  async function autoConfigureConnectorsForLauncher() {
     setConnectorsBusy(true);
     setConnectorsError(null);
 
@@ -2298,7 +2298,7 @@ export default function App() {
 
       const step = nextAutoConfigureStep(
         getLauncherAutoConfigureDecision(latestConnectors),
-        getClaudeConnector(latestConnectors)
+        latestConnectors
       );
 
       if (step.kind === "show_client_setup") {
@@ -2307,9 +2307,9 @@ export default function App() {
       }
 
       if (step.kind === "apply") {
-        await invoke<ClientSetupResult>("apply_client_setup", {
-          clientId: step.clientId
-        });
+        for (const clientId of step.clientIds) {
+          await invoke<ClientSetupResult>("apply_client_setup", { clientId });
+        }
         latestConnectors = await invoke<ClientConnectorStatus[]>("get_client_connectors");
         applyConnectorsIfChanged(latestConnectors);
 
@@ -2325,7 +2325,7 @@ export default function App() {
       await beginProxyVerificationStep();
     } catch (error) {
       setConnectorsError(
-        error instanceof Error ? error.message : "Could not configure Claude Code automatically."
+        error instanceof Error ? error.message : "Could not configure your coding tools automatically."
       );
       setLauncherStage("client_setup");
     } finally {
@@ -2334,7 +2334,7 @@ export default function App() {
   }
 
   async function handleFirstLaunchContinue() {
-    await autoConfigureClaudeCodeForLauncher();
+    await autoConfigureConnectorsForLauncher();
   }
 
   async function runHeadroomLearn(projectPath: string) {
@@ -3158,7 +3158,7 @@ export default function App() {
         showSpinner={bootstrapping}
       >
         <h1>
-          Headroom cuts Claude Code costs
+          Headroom cuts Claude Code and Codex costs
           <br />
            ~<span className="headline-highlight">50%</span> by trimming prompt bloat.
         </h1>
@@ -3179,7 +3179,7 @@ export default function App() {
           <article>
             <strong>Less tokens, no impact</strong>
             <p>
-              Smart optimization cuts noise before Claude Code sees it, with
+              Smart optimization cuts noise before your coding tool sees it, with
               no impact on the output.
             </p>
           </article>
@@ -3560,7 +3560,7 @@ export default function App() {
           ) : (
             <>
               <p>
-                It will trim prompt bloat whenever you use Claude Code.
+                It will trim prompt bloat whenever you use Claude Code or Codex.
               </p>
               <div className="post-install__metrics">
                 <article className="soft-card stat-card">
@@ -3886,7 +3886,7 @@ export default function App() {
     }
     return {
       tone: pricingStatus.optimizationAllowed ? "warning" as const : "expired" as const,
-      message: `Trial expired. You can only use Headroom for ${weeklyLimitPercentLabel} of your weekly Claude Code limits. To continue using Headroom without limits.`,
+      message: `Trial expired. You can only use Headroom for ${weeklyLimitPercentLabel} of your weekly Claude Code and Codex limits. To continue using Headroom without limits.`,
       actionLabel: "Upgrade",
       onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
     };

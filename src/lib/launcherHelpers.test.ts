@@ -70,6 +70,12 @@ describe("launcher helpers", () => {
         }
       ])
     ).toBe("begin_proxy_verification");
+    // Codex-only: a non-Claude tool drives the same auto-configure decision.
+    expect(
+      getLauncherAutoConfigureDecision([
+        { clientId: "codex", name: "Codex", installed: true, enabled: false, verified: false }
+      ])
+    ).toBe("apply_client_setup");
   });
 
   it("builds initial proxy verification rows from enabled installed Claude connectors", () => {
@@ -136,27 +142,45 @@ describe("launcher helpers", () => {
       verified: false
     };
 
+    const codex: ClientConnectorStatus = {
+      clientId: "codex",
+      name: "Codex",
+      installed: true,
+      enabled: false,
+      verified: false
+    };
+
     it("routes show_client_setup decisions to manual setup", () => {
-      expect(nextAutoConfigureStep("show_client_setup", claude)).toEqual({
+      expect(nextAutoConfigureStep("show_client_setup", [claude])).toEqual({
         kind: "show_client_setup"
       });
     });
 
-    it("routes apply_client_setup to an apply step using the connector's clientId", () => {
-      expect(nextAutoConfigureStep("apply_client_setup", claude)).toEqual({
+    it("routes apply_client_setup to an apply step for every installed, not-yet-enabled connector", () => {
+      expect(nextAutoConfigureStep("apply_client_setup", [claude, codex])).toEqual({
         kind: "apply",
-        clientId: "claude_code"
+        clientIds: ["claude_code", "codex"]
       });
     });
 
+    it("only applies connectors that are installed and not already enabled", () => {
+      expect(
+        nextAutoConfigureStep("apply_client_setup", [
+          { ...claude, enabled: true },
+          codex,
+          { clientId: "codex", name: "Codex", installed: false, enabled: false, verified: false }
+        ])
+      ).toEqual({ kind: "apply", clientIds: ["codex"] });
+    });
+
     it("falls back to manual setup when apply_client_setup has no detected connector", () => {
-      expect(nextAutoConfigureStep("apply_client_setup", null)).toEqual({
+      expect(nextAutoConfigureStep("apply_client_setup", [])).toEqual({
         kind: "show_client_setup"
       });
     });
 
     it("routes begin_proxy_verification straight to proxy verification", () => {
-      expect(nextAutoConfigureStep("begin_proxy_verification", null)).toEqual({
+      expect(nextAutoConfigureStep("begin_proxy_verification", [])).toEqual({
         kind: "begin_proxy_verification"
       });
     });

@@ -22,7 +22,7 @@ export type LauncherAutoConfigureDecision =
 /// calls; this helper isolates the decision logic so it can be unit-tested.
 export type AutoConfigureStep =
   | { kind: "show_client_setup" }
-  | { kind: "apply"; clientId: string }
+  | { kind: "apply"; clientIds: string[] }
   | { kind: "begin_proxy_verification" };
 
 export interface ProxyVerificationRowState {
@@ -60,11 +60,13 @@ export function getClaudeConnector(connectors: ClientConnectorStatus[]) {
 export function getLauncherAutoConfigureDecision(
   connectors: ClientConnectorStatus[]
 ): LauncherAutoConfigureDecision {
-  const connector = getClaudeConnector(connectors);
-  if (!connector?.installed) {
+  const installed = aggregateClientConnectors(connectors).filter(
+    (connector) => connector.installed
+  );
+  if (installed.length === 0) {
     return "show_client_setup";
   }
-  if (!connector.enabled) {
+  if (installed.some((connector) => !connector.enabled)) {
     return "apply_client_setup";
   }
   return "begin_proxy_verification";
@@ -92,17 +94,20 @@ export function getInitialLauncherStage(
 /// given a fresh connector probe. Pre-apply only.
 export function nextAutoConfigureStep(
   decision: LauncherAutoConfigureDecision,
-  claudeConnector: ClientConnectorStatus | null
+  connectors: ClientConnectorStatus[]
 ): AutoConfigureStep {
   if (decision === "show_client_setup") {
     return { kind: "show_client_setup" };
   }
   if (decision === "apply_client_setup") {
-    if (!claudeConnector) {
+    const clientIds = aggregateClientConnectors(connectors)
+      .filter((connector) => connector.installed && !connector.enabled)
+      .map((connector) => connector.clientId);
+    if (clientIds.length === 0) {
       // No connector to apply against — fall back to manual setup.
       return { kind: "show_client_setup" };
     }
-    return { kind: "apply", clientId: claudeConnector.clientId };
+    return { kind: "apply", clientIds };
   }
   return { kind: "begin_proxy_verification" };
 }
