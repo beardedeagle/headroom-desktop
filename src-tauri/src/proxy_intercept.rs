@@ -24,6 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::backend_port;
 use crate::bearer::{BearerToken, BEARER_TOKEN_TTL};
+use crate::models::{CodexRateLimitSnapshot, CodexUsageWindow};
 
 pub const INTERCEPT_PORT: u16 = 6767;
 
@@ -34,6 +35,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Shared state written by the intercept layer.
 pub type SharedToken = Arc<Mutex<Option<BearerToken>>>;
+
+/// Latest Codex rate-limit snapshot captured from `x-codex-*` response headers.
+/// Shared with `AppState::codex_rate_limits`; read by `pricing::fetch_codex_usage`.
+pub type CodexRateLimitSlot = Arc<Mutex<Option<CodexRateLimitSnapshot>>>;
 
 /// When set to `true`, the intercept forwards traffic directly to
 /// api.anthropic.com instead of the local Python proxy. Used to keep already-
@@ -56,6 +61,7 @@ pub const OPENAI_DIRECT_BASE: &str = "https://api.openai.com";
 /// from Tauri's `.setup()` before the main async runtime has started.
 pub fn spawn(
     token_slot: SharedToken,
+    codex_slot: CodexRateLimitSlot,
     bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
 ) {
@@ -72,6 +78,7 @@ pub fn spawn(
                 match run(
                     bind_addr,
                     token_slot,
+                    codex_slot,
                     bypass,
                     fresh_bearer_tx,
                     upstream_base,
@@ -118,6 +125,7 @@ pub fn spawn(
 async fn run(
     bind_addr: SocketAddr,
     token_slot: SharedToken,
+    codex_slot: CodexRateLimitSlot,
     bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
     upstream_base: Arc<String>,
@@ -128,10 +136,11 @@ async fn run(
         match listener.accept().await {
             Ok((client, _)) => {
                 let slot = token_slot.clone();
+                let codex_slot = codex_slot.clone();
                 let bypass = bypass.clone();
                 let upstream_base = upstream_base.clone();
                 let tx = fresh_bearer_tx.clone();
-                tokio::spawn(handle(client, slot, bypass, tx, upstream_base));
+                tokio::spawn(handle(client, slot, codex_slot, bypass, tx, upstream_base));
             }
             Err(e) => {
                 // EMFILE/ENFILE/ECONNABORTED are transient — log and keep serving
@@ -158,6 +167,7 @@ fn bearer_value_changed(slot: &SharedToken, candidate: &str) -> bool {
 async fn handle(
     mut client: TcpStream,
     token_slot: SharedToken,
+    codex_slot: CodexRateLimitSlot,
     bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
     upstream_base: Arc<String>,
@@ -228,7 +238,153 @@ async fn handle(
         return;
     }
 
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+    // For Codex (OpenAI) requests, sniff the backend response head so we can
+    // capture the `x-codex-*` rate-limit headers that feed the usage gauge.
+    // Codex always streams, so the Python backend's own capture (non-streaming
+    // only) never fires for it — this proxy is the only component left in the
+    // response path that sees those headers. Every other client (Claude) keeps
+    // the untouched zero-copy splice.
+    let is_codex = find_header_end(&buf)
+        .and_then(|end| parse_request_head(&buf[..end + 4]))
+        .is_some_and(|head| is_openai_path(&head.path));
+
+    if is_codex {
+        splice_with_codex_capture(client, backend, &codex_slot).await;
+    } else {
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+    }
+}
+
+/// Splice client <-> backend while sniffing the backend's response head for
+/// `x-codex-*` rate-limit headers. Only the response head is read up-front (the
+/// body/SSE bytes that follow are spliced through verbatim), so streaming
+/// responses are neither buffered nor delayed beyond their header block. On any
+/// read error before the head completes, whatever was read is still forwarded,
+/// so the response is never corrupted.
+async fn splice_with_codex_capture(
+    mut client: TcpStream,
+    mut backend: TcpStream,
+    codex_slot: &CodexRateLimitSlot,
+) {
+    let (mut client_rd, mut client_wr) = client.split();
+    let (mut backend_rd, mut backend_wr) = backend.split();
+
+    // client -> backend: opaque copy (request body / pipelined requests).
+    let upstream = async {
+        let _ = tokio::io::copy(&mut client_rd, &mut backend_wr).await;
+        let _ = backend_wr.shutdown().await;
+    };
+
+    // backend -> client: capture the response head, then stream the remainder.
+    let downstream = async {
+        let mut head = Vec::with_capacity(4096);
+        let read_head = tokio::time::timeout(
+            HEADER_READ_TIMEOUT,
+            read_http_headers(&mut backend_rd, &mut head),
+        )
+        .await;
+
+        if matches!(read_head, Ok(Ok(()))) {
+            if let Some(snapshot) = parse_codex_rate_limit_headers(&head) {
+                *codex_slot.lock() = Some(snapshot);
+            }
+        }
+
+        // Forward the head bytes we read (full head on success, partial on
+        // timeout/EOF — `read_http_headers` may also include leading body bytes
+        // it over-read), then splice the rest of the response through.
+        if client_wr.write_all(&head).await.is_err() {
+            return;
+        }
+        let _ = tokio::io::copy(&mut backend_rd, &mut client_wr).await;
+        let _ = client_wr.shutdown().await;
+    };
+
+    tokio::join!(upstream, downstream);
+}
+
+/// Parse the `x-codex-*` rate-limit headers out of a raw HTTP response head
+/// (status line + headers up to the blank line). Mirrors the schema in upstream
+/// `headroom/subscription/codex_rate_limits.py`. Returns `None` when there is no
+/// usable signal (no windows and no credits balance).
+fn parse_codex_rate_limit_headers(head: &[u8]) -> Option<CodexRateLimitSnapshot> {
+    let text = std::str::from_utf8(head).ok()?;
+
+    let mut headers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in text.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break; // end of header block
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let parse_window = |prefix: &str| -> Option<CodexUsageWindow> {
+        let used_percent: f64 = headers
+            .get(&format!("x-codex-{prefix}-used-percent"))?
+            .parse()
+            .ok()?;
+        let window_minutes = headers
+            .get(&format!("x-codex-{prefix}-window-minutes"))
+            .and_then(|v| v.parse::<i64>().ok());
+        let reset_at = headers
+            .get(&format!("x-codex-{prefix}-reset-at"))
+            .and_then(|v| v.parse::<i64>().ok());
+        Some(CodexUsageWindow {
+            used_percent,
+            window_label: window_minutes.map(codex_window_label),
+            window_minutes,
+            seconds_until_reset: reset_at.map(|r| (r - now).max(0)),
+        })
+    };
+
+    let primary = parse_window("primary");
+    let secondary = parse_window("secondary");
+    let credits_balance = headers
+        .get("x-codex-credits-balance")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let credits_unlimited = headers
+        .get("x-codex-credits-unlimited")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    let limit_name = headers
+        .get("x-codex-limit-name")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if primary.is_none() && secondary.is_none() && credits_balance.is_none() {
+        return None;
+    }
+
+    Some(CodexRateLimitSnapshot {
+        limit_name,
+        primary,
+        secondary,
+        credits_balance,
+        credits_unlimited,
+    })
+}
+
+/// Window label derived from a minute count, matching upstream's
+/// `CodexRateLimitWindow.window_label` (`<60` -> "Nm", else "Hh" / "HhMMm").
+fn codex_window_label(window_minutes: i64) -> String {
+    if window_minutes < 60 {
+        return format!("{window_minutes}m");
+    }
+    let hours = window_minutes / 60;
+    let mins = window_minutes % 60;
+    if mins == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h{mins:02}m")
+    }
 }
 
 static UPSTREAM_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -610,9 +766,10 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value_changed, extract_bearer, find_header_end, is_hop_by_hop_request_header,
-        is_hop_by_hop_response_header, is_local_proxy_path, is_openai_path, parse_request_head,
-        read_http_headers, request_is_loopback_safe, run, BypassFlag, SharedToken,
+        bearer_value_changed, codex_window_label, extract_bearer, find_header_end,
+        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
+        is_openai_path, parse_codex_rate_limit_headers, parse_request_head, read_http_headers,
+        request_is_loopback_safe, run, BypassFlag, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -792,6 +949,7 @@ mod tests {
             let _ = run(
                 intercept_addr,
                 slot_for_run,
+                Arc::new(Mutex::new(None)),
                 bypass_for_run,
                 fresh_bearer_tx,
                 upstream_base,
@@ -873,6 +1031,7 @@ mod tests {
             let _ = run(
                 intercept_addr,
                 slot_for_run,
+                Arc::new(Mutex::new(None)),
                 bypass_for_run,
                 fresh_bearer_tx,
                 upstream_base,
@@ -1075,6 +1234,7 @@ mod tests {
             let _ = run(
                 intercept_addr,
                 token_for_run,
+                Arc::new(Mutex::new(None)),
                 bypass,
                 fresh_bearer_tx,
                 upstream_base_arc,
@@ -1213,6 +1373,7 @@ mod tests {
             let _ = run(
                 intercept_addr,
                 token_slot,
+                Arc::new(Mutex::new(None)),
                 bypass,
                 fresh_bearer_tx,
                 upstream_base_arc,
@@ -1303,6 +1464,7 @@ mod tests {
             let _ = run(
                 intercept_addr,
                 token_for_run,
+                Arc::new(Mutex::new(None)),
                 bypass_for_run,
                 fresh_bearer_tx,
                 upstream_base,
@@ -1354,5 +1516,80 @@ mod tests {
 
         run_task.abort();
         backend_port::reset_for_tests();
+    }
+
+    // ── codex rate-limit header parsing ─────────────────────────────────────
+
+    #[test]
+    fn parse_codex_headers_decodes_primary_secondary_credits() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\n\
+             content-type: text/event-stream\r\n\
+             x-codex-limit-name: gpt-5.2-codex\r\n\
+             x-codex-primary-used-percent: 42.5\r\n\
+             x-codex-primary-window-minutes: 300\r\n\
+             x-codex-primary-reset-at: {}\r\n\
+             x-codex-secondary-used-percent: 12\r\n\
+             x-codex-secondary-window-minutes: 10080\r\n\
+             x-codex-secondary-reset-at: {}\r\n\
+             x-codex-credits-balance: $5.00\r\n\
+             x-codex-credits-unlimited: false\r\n\
+             \r\n",
+            now + 7200,
+            now + 86400,
+        );
+        let snap = parse_codex_rate_limit_headers(head.as_bytes()).expect("snapshot");
+        assert_eq!(snap.limit_name.as_deref(), Some("gpt-5.2-codex"));
+        let primary = snap.primary.expect("primary");
+        assert_eq!(primary.used_percent, 42.5);
+        assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(primary.window_label.as_deref(), Some("5h"));
+        // Reset is ~7200s out; allow a couple seconds of clock slack.
+        let secs = primary.seconds_until_reset.expect("reset");
+        assert!((7195..=7200).contains(&secs), "got {secs}");
+        let secondary = snap.secondary.expect("secondary");
+        assert_eq!(secondary.window_label.as_deref(), Some("168h"));
+        assert_eq!(snap.credits_balance.as_deref(), Some("$5.00"));
+        assert!(!snap.credits_unlimited);
+    }
+
+    #[test]
+    fn parse_codex_headers_case_insensitive_and_clamps_past_reset() {
+        let head = "HTTP/1.1 429 Too Many Requests\r\n\
+             X-Codex-Primary-Used-Percent: 99\r\n\
+             X-Codex-Primary-Window-Minutes: 45\r\n\
+             X-Codex-Primary-Reset-At: 100\r\n\
+             \r\n";
+        let snap = parse_codex_rate_limit_headers(head.as_bytes()).expect("snapshot");
+        let primary = snap.primary.expect("primary");
+        assert_eq!(primary.used_percent, 99.0);
+        assert_eq!(primary.window_label.as_deref(), Some("45m"));
+        // reset-at is in the distant past -> clamped to 0.
+        assert_eq!(primary.seconds_until_reset, Some(0));
+    }
+
+    #[test]
+    fn parse_codex_headers_absent_returns_none() {
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n";
+        assert!(parse_codex_rate_limit_headers(head.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn parse_codex_headers_partial_head_returns_none() {
+        // No header terminator / garbage — must not panic, no signal.
+        let head = "HTTP/1.1 200 OK\r\nx-codex-limit-name: codex";
+        assert!(parse_codex_rate_limit_headers(head.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn codex_window_label_formats() {
+        assert_eq!(codex_window_label(45), "45m");
+        assert_eq!(codex_window_label(300), "5h");
+        assert_eq!(codex_window_label(10080), "168h");
+        assert_eq!(codex_window_label(90), "1h30m");
     }
 }

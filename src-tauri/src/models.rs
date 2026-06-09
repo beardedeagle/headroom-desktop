@@ -657,10 +657,10 @@ pub struct ClaudeAccountProfile {
     pub profile_fetch_error: Option<String>,
 }
 
-/// A single Codex (OpenAI) rate-limit window, parsed from the backend `/stats`
-/// `codex_rate_limits` block (itself sourced from `x-codex-*` response headers).
-/// Windows are labeled dynamically by the upstream server (e.g. "5h", "7d"), so
-/// the label is carried verbatim rather than assumed.
+/// A single Codex (OpenAI) rate-limit window, sourced from the `x-codex-*`
+/// response headers our intercept proxy captures off live Codex traffic
+/// (`proxy_intercept::parse_codex_rate_limit_headers`). Windows are labeled by
+/// minute count (e.g. "5h", "7d") derived the same way upstream does.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexUsageWindow {
@@ -685,6 +685,19 @@ pub struct CodexUsage {
     pub should_nudge: bool,
     /// Display copy for the codex usage state (active / nudging / near-limit).
     pub gate_message: String,
+}
+
+/// Raw Codex rate-limit snapshot captured by the intercept proxy from the
+/// `x-codex-*` response headers. Internal only (not serialized to the UI):
+/// `pricing::fetch_codex_usage` reads the latest snapshot and derives the
+/// display-facing `CodexUsage` (nudge state, gate copy) on the fly.
+#[derive(Debug, Clone, Default)]
+pub struct CodexRateLimitSnapshot {
+    pub limit_name: Option<String>,
+    pub primary: Option<CodexUsageWindow>,
+    pub secondary: Option<CodexUsageWindow>,
+    pub credits_balance: Option<String>,
+    pub credits_unlimited: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

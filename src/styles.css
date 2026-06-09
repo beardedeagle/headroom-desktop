@@ -3346,10 +3346,10 @@ details[open] .optimize-minimal__details summary::after {
 
 .callout-banner__connectors {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  margin-top: 10px;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  margin-top: 1px;
 }
 
 .callout-banner__chip {

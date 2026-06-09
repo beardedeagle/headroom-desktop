@@ -2732,6 +2732,7 @@ pub fn run() {
             // Start the intercept layer before anything else touches port 6767.
             proxy_intercept::spawn(
                 std::sync::Arc::clone(&state.claude_bearer_token),
+                std::sync::Arc::clone(&state.codex_rate_limits),
                 std::sync::Arc::clone(&state.proxy_bypass),
                 fresh_bearer_tx,
             );

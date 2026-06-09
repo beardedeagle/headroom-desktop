@@ -3384,11 +3384,10 @@ export default function App() {
                         Restart {connector.name} to apply changes.
                       </p>
                     ) : null}
-                    {detectionWarning ? (
-                      <p className="connector-item__reason">{detectionWarning}</p>
-                    ) : null}
-                    {unavailableReason ? (
-                      <p className="connector-item__reason">{unavailableReason}</p>
+                    {(detectionWarning ?? unavailableReason) ? (
+                      <p className="connector-item__reason">
+                        {detectionWarning ?? unavailableReason}
+                      </p>
                     ) : null}
                   </div>
                   <div className="connector-item__controls">
@@ -4113,35 +4112,35 @@ export default function App() {
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
                   <p className="callout-banner__subtitle">Now use your connected tools as normal, and check back later to see how much you are saving by using Headroom.</p>
                 )}
-                {(() => {
-                  const homeConnectors = sortClientConnectors(aggregateClientConnectors(connectors))
-                    .filter((connector) => connector.installed || connector.enabled);
-                  if (homeConnectors.length === 0) {
-                    return null;
-                  }
-                  return (
-                    <div className="callout-banner__connectors">
-                      {homeConnectors.map((connector) => {
-                        const status = connectorDashboardStatus(connector);
-                        return (
-                          <span
-                            className="callout-banner__chip"
-                            key={connector.clientId}
-                            title={status.label}
-                          >
-                            <span
-                              className={`callout-banner__chip-dot callout-banner__chip-dot--${status.tone}`}
-                              aria-hidden="true"
-                            />
-                            <span className="callout-banner__chip-name">{connector.name}</span>
-                            <span className="visually-hidden">{status.label}</span>
-                          </span>
-                        );
-                      })}
-                    </div>
-                  );
-                })()}
               </div>
+              {(() => {
+                const homeConnectors = sortClientConnectors(aggregateClientConnectors(connectors))
+                  .filter((connector) => connector.installed || connector.enabled);
+                if (homeConnectors.length === 0) {
+                  return null;
+                }
+                return (
+                  <div className="callout-banner__connectors">
+                    {homeConnectors.map((connector) => {
+                      const status = connectorDashboardStatus(connector);
+                      return (
+                        <span
+                          className="callout-banner__chip"
+                          key={connector.clientId}
+                          title={status.label}
+                        >
+                          <span
+                            className={`callout-banner__chip-dot callout-banner__chip-dot--${status.tone}`}
+                            aria-hidden="true"
+                          />
+                          <span className="callout-banner__chip-name">{connector.name}</span>
+                          <span className="visually-hidden">{status.label}</span>
+                        </span>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
             </section>
 
             {(() => {
@@ -4814,11 +4813,10 @@ export default function App() {
                               Restart {connector.name} to start routing through Headroom.
                             </p>
                           ) : null}
-                          {detectionWarning ? (
-                            <p className="connector-item__reason">{detectionWarning}</p>
-                          ) : null}
-                          {unavailableReason ? (
-                            <p className="connector-item__reason">{unavailableReason}</p>
+                          {(detectionWarning ?? unavailableReason) ? (
+                            <p className="connector-item__reason">
+                              {detectionWarning ?? unavailableReason}
+                            </p>
                           ) : null}
                           {connector.clientId === "codex" && connector.enabled
                             ? renderCodexUsage(pricingStatus?.codex)

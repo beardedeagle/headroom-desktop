@@ -21,7 +21,7 @@ use crate::client_adapters::{detect_clients, ensure_rtk_integrations, rtk_integr
 use crate::insights::generate_daily_insights;
 use crate::models::{
     ActivityEvent, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus,
-    DailyInsight, DailySavingsPoint, DashboardState, HeadroomLearnPrereqStatus,
+    CodexRateLimitSnapshot, DailyInsight, DailySavingsPoint, DashboardState, HeadroomLearnPrereqStatus,
     HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus,
     RuntimeStatus, RuntimeUpgradeFailure, RuntimeUpgradeProgress, TransformationFeedEvent,
     UpgradeFailurePhase, UsageEvent,
@@ -435,6 +435,11 @@ pub struct AppState {
     /// Only populated when the user runs Claude Code authenticated via Claude AI (not API key).
     /// Wrapped in Arc so the proxy_intercept task can share it without going through AppState.
     pub claude_bearer_token: Arc<Mutex<Option<BearerToken>>>,
+    /// Latest Codex (OpenAI) rate-limit snapshot captured by the proxy intercept
+    /// from `x-codex-*` response headers. Wrapped in Arc so the proxy_intercept
+    /// task can update it without going through AppState; read by
+    /// `pricing::fetch_codex_usage` to drive the Codex usage gauge.
+    pub codex_rate_limits: Arc<Mutex<Option<CodexRateLimitSnapshot>>>,
     /// When true, the Rust intercept on :6767 forwards traffic directly to
     /// api.anthropic.com instead of the Python proxy on :6768. Flipped on by
     /// `enforce_pricing_gate` once a Pro/Max user crosses the disable threshold
@@ -551,6 +556,7 @@ impl AppState {
                 overall_percent: 0,
             }),
             claude_bearer_token: Arc::new(Mutex::new(None)),
+            codex_rate_limits: Arc::new(Mutex::new(None)),
             proxy_bypass: Arc::new(AtomicBool::new(false)),
             pricing_gate_violation_streak: Arc::new(AtomicU32::new(0)),
             headroom_learn_state: Mutex::new(HeadroomLearnRuntimeState {
