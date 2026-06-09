@@ -1279,18 +1279,31 @@ fn codex_config_toml_path() -> PathBuf {
     home_dir().join(".codex").join("config.toml")
 }
 
-/// Body of the managed Codex provider block written into `~/.codex/config.toml`.
-/// Mirrors upstream `headroom.providers.codex.install.apply_provider_scope`:
-/// a top-level `model_provider`/`openai_base_url` plus a custom
-/// `[model_providers.headroom]` table pointing at the local proxy. The
-/// `requires_openai_auth` flag is intentionally omitted (it would force Codex
-/// to demand OpenAI OAuth for local-proxy traffic).
-fn codex_provider_block_body() -> String {
+// The managed Codex config is split across two marker blocks so each lands in
+// the correct TOML scope. `model_provider`/`openai_base_url` are root keys: a
+// bare key belongs to the most recently opened `[table]` above it, so appending
+// them at end-of-file (as a naive text upsert does) silently absorbs them into
+// whatever table the user's config happens to end in (e.g. `[features]`, whose
+// values must be booleans), producing
+// `invalid type: string "headroom", expected a boolean in features`. The root
+// keys therefore go in a block at the *top* of the file (nothing above ⇒ root
+// scope), and the `[model_providers.headroom]` table goes in a block at the
+// *end*. `requires_openai_auth` is intentionally omitted (it would force Codex
+// to demand OpenAI OAuth for local-proxy traffic).
+const CODEX_ROOT_BLOCK_ID: &str = "codex_cli";
+const CODEX_TABLE_BLOCK_ID: &str = "codex_cli_provider";
+
+fn codex_root_keys_body() -> String {
     format!(
         "model_provider = \"headroom\"\n\
-         openai_base_url = \"{base}\"\n\
-         \n\
-         [model_providers.headroom]\n\
+         openai_base_url = \"{base}\"",
+        base = HEADROOM_OPENAI_BASE_URL,
+    )
+}
+
+fn codex_provider_table_body() -> String {
+    format!(
+        "[model_providers.headroom]\n\
          name = \"Headroom persistent proxy\"\n\
          base_url = \"{base}\"\n\
          supports_websockets = true",
@@ -1298,18 +1311,93 @@ fn codex_provider_block_body() -> String {
     )
 }
 
+fn codex_marker_block(block_id: &str, body: &str) -> String {
+    format!("# >>> headroom:{block_id} >>>\n{body}\n# <<< headroom:{block_id} <<<\n")
+}
+
+/// Remove every Headroom-managed artifact from Codex `config.toml` text: both
+/// managed marker blocks, plus any orphan root keys an older (buggy) build may
+/// have left absorbed into a preceding table. Leaves all other content intact.
+fn strip_codex_managed_toml(content: &str) -> String {
+    let without_blocks = strip_marker_block(
+        &strip_marker_block(content, CODEX_ROOT_BLOCK_ID),
+        CODEX_TABLE_BLOCK_ID,
+    );
+    let openai_orphan_prefix = "openai_base_url = \"http://127.0.0.1:";
+    without_blocks
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed == "model_provider = \"headroom\""
+                || (trimmed.starts_with(openai_orphan_prefix) && trimmed.ends_with("/v1\"")))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Pure-text removal of a single `# >>> headroom:<id> >>> ... <<<` block.
+fn strip_marker_block(content: &str, block_id: &str) -> String {
+    let start = format!("# >>> headroom:{block_id} >>>");
+    let end = format!("# <<< headroom:{block_id} <<<");
+    let (Some(start_idx), Some(end_idx)) = (content.find(&start), content.find(&end)) else {
+        return content.to_string();
+    };
+    let tail = content[end_idx + end.len()..].trim_start_matches('\n');
+    let head = content[..start_idx].trim_end();
+    let mut rebuilt = String::with_capacity(content.len());
+    rebuilt.push_str(head);
+    if !rebuilt.is_empty() && !tail.is_empty() {
+        rebuilt.push('\n');
+    }
+    rebuilt.push_str(tail);
+    rebuilt
+}
+
+/// Reconstruct `config.toml` with the managed root keys pinned to the top and
+/// the provider table appended at the end, around the user's other content.
+fn render_codex_config(existing: &str) -> String {
+    let mid = strip_codex_managed_toml(existing);
+    let mid = mid.trim();
+
+    let mut out = codex_marker_block(CODEX_ROOT_BLOCK_ID, &codex_root_keys_body());
+    if !mid.is_empty() {
+        out.push('\n');
+        out.push_str(mid);
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&codex_marker_block(
+        CODEX_TABLE_BLOCK_ID,
+        &codex_provider_table_body(),
+    ));
+    out
+}
+
 fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>)> {
     let path = codex_config_toml_path();
-    let (changed, backup) = upsert_managed_block(&path, "codex_cli", &codex_provider_block_body())?;
-    let mut changed_files = Vec::new();
-    let mut backup_files = Vec::new();
-    if changed {
-        changed_files.push(path.display().to_string());
-        if let Some(backup_path) = backup {
-            backup_files.push(backup_path.display().to_string());
-        }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
-    Ok((changed_files, backup_files))
+    let existing = if path.exists() {
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    let updated = render_codex_config(&existing);
+    if updated == existing {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let backup = backup_if_exists(&path)?;
+    std::fs::write(&path, &updated).with_context(|| format!("writing {}", path.display()))?;
+
+    let mut backup_files = Vec::new();
+    if let Some(backup_path) = backup {
+        backup_files.push(backup_path.display().to_string());
+    }
+    Ok((vec![path.display().to_string()], backup_files))
 }
 
 fn codex_provider_block_matches() -> Result<bool> {
@@ -1319,19 +1407,46 @@ fn codex_provider_block_matches() -> Result<bool> {
     }
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let start = "# >>> headroom:codex_cli >>>";
-    let end = "# <<< headroom:codex_cli <<<";
-    if let (Some(start_idx), Some(end_idx)) = (content.find(start), content.find(end)) {
-        let block = &content[start_idx..end_idx];
-        let expected = format!("base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
-        return Ok(block.contains(&expected));
+    let base_url = format!("base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
+    let openai_base = format!("openai_base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
+    let root_ok = marker_block_contains(&content, CODEX_ROOT_BLOCK_ID, "model_provider = \"headroom\"")
+        && marker_block_contains(&content, CODEX_ROOT_BLOCK_ID, &openai_base);
+    let table_ok = marker_block_contains(&content, CODEX_TABLE_BLOCK_ID, &base_url);
+    Ok(root_ok && table_ok)
+}
+
+fn marker_block_contains(content: &str, block_id: &str, needle: &str) -> bool {
+    let start = format!("# >>> headroom:{block_id} >>>");
+    let end = format!("# <<< headroom:{block_id} <<<");
+    match (content.find(&start), content.find(&end)) {
+        (Some(start_idx), Some(end_idx)) if start_idx < end_idx => {
+            content[start_idx..end_idx].contains(needle)
+        }
+        _ => false,
     }
-    Ok(false)
 }
 
 fn remove_codex_provider_block() -> Result<()> {
     let path = codex_config_toml_path();
-    let _ = remove_managed_block(&path, "codex_cli")?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let existing =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let stripped = strip_codex_managed_toml(&existing);
+    let normalized = {
+        let trimmed = stripped.trim();
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}\n")
+        }
+    };
+    if normalized == existing {
+        return Ok(());
+    }
+    let _ = backup_if_exists(&path)?;
+    std::fs::write(&path, &normalized).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -3334,6 +3449,115 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             1,
             "managed block appears exactly once"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_keeps_root_keys_at_root_scope_when_config_ends_in_a_table() {
+        // Regression for the `invalid type: string "headroom", expected a
+        // boolean in features` error: a config whose last table is `[features]`
+        // (boolean-only values) used to absorb the appended root keys.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            "model = \"gpt-5.4\"\n\n[features]\njs_repl = false\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+
+        let raw = fs::read_to_string(&config_toml).unwrap();
+        let parsed: toml::Value = raw.parse().unwrap_or_else(|e| panic!("valid toml: {e}\n{raw}"));
+
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some("headroom"),
+            "model_provider must resolve at root scope, got:\n{raw}"
+        );
+        assert!(
+            parsed
+                .get("features")
+                .and_then(|f| f.get("model_provider"))
+                .is_none(),
+            "model_provider must not leak into [features], got:\n{raw}"
+        );
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|m| m.get("headroom"))
+                .and_then(|h| h.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some(super::HEADROOM_OPENAI_BASE_URL),
+            "provider table base_url points at the proxy, got:\n{raw}"
+        );
+        // The user's own content survives untouched.
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("gpt-5.4"),
+            "existing root key preserved, got:\n{raw}"
+        );
+        assert_eq!(
+            parsed
+                .get("features")
+                .and_then(|f| f.get("js_repl"))
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "existing [features] table preserved, got:\n{raw}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_repairs_a_previously_corrupted_features_block() {
+        // A machine upgraded mid-bug: the old single block sits at end-of-file,
+        // its root keys absorbed into [features]. Re-applying must repair it so
+        // the file parses and the keys resolve at root scope.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            "[features]\njs_repl = false\n\
+             # >>> headroom:codex_cli >>>\n\
+             model_provider = \"headroom\"\n\
+             openai_base_url = \"http://127.0.0.1:6767/v1\"\n\n\
+             [model_providers.headroom]\n\
+             name = \"Headroom persistent proxy\"\n\
+             base_url = \"http://127.0.0.1:6767/v1\"\n\
+             supports_websockets = true\n\
+             # <<< headroom:codex_cli <<<\n",
+        )
+        .unwrap();
+
+        // The corrupted file is invalid against Codex's schema, but still parses
+        // as TOML with the key wrongly nested under [features].
+        let before: toml::Value = fs::read_to_string(&config_toml).unwrap().parse().unwrap();
+        assert_eq!(
+            before
+                .get("features")
+                .and_then(|f| f.get("model_provider"))
+                .and_then(|v| v.as_str()),
+            Some("headroom"),
+            "precondition: corruption present"
+        );
+
+        super::apply_client_setup("codex").expect("re-apply repairs config");
+
+        let after: toml::Value = fs::read_to_string(&config_toml).unwrap().parse().unwrap();
+        assert_eq!(
+            after.get("model_provider").and_then(|v| v.as_str()),
+            Some("headroom")
+        );
+        assert!(after
+            .get("features")
+            .and_then(|f| f.get("model_provider"))
+            .is_none());
     }
 
     #[test]
