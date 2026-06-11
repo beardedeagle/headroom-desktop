@@ -2109,10 +2109,18 @@ impl AppState {
                 merge_hourly_savings(hourly_savings, history.hourly_savings(), &cutoff_hour);
         }
 
+        let (launch_experience, accepted_terms_version) = {
+            let profile = self.launch_profile.lock();
+            (
+                profile.launch_experience.clone(),
+                profile.accepted_terms_version,
+            )
+        };
+
         (
             DashboardState {
                 app_version: env!("CARGO_PKG_VERSION").into(),
-                launch_experience: self.launch_profile.lock().launch_experience.clone(),
+                launch_experience,
                 bootstrap_complete: self.tool_manager.python_runtime_installed(),
                 python_runtime_installed: self.tool_manager.python_runtime_installed(),
                 lifetime_requests: snapshot.lifetime_requests,
@@ -2129,7 +2137,7 @@ impl AppState {
                 recent_usage,
                 insights,
                 required_terms_version: REQUIRED_TERMS_VERSION,
-                accepted_terms_version: self.launch_profile.lock().accepted_terms_version,
+                accepted_terms_version,
                 terms_url: TERMS_URL.to_string(),
             },
             pending_milestones,
