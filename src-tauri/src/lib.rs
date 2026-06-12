@@ -385,21 +385,46 @@ fn restart_app(app: AppHandle) {
     // deadlocks, so the lock is always freed and the new instance can boot.
     #[cfg(target_os = "macos")]
     {
-        if let Some(bundle) = current_app_bundle_path() {
-            let pid = std::process::id();
-            let quoted = shell_quote_path(&bundle);
-            let cmd = format!(
-                "alive=1; \
-                 for i in $(seq 1 100); do \
-                   if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
-                   sleep 0.1; \
-                 done; \
-                 if [ \"$alive\" = 1 ]; then kill -9 {pid} 2>/dev/null; sleep 0.5; fi; \
-                 /usr/bin/open -n {quoted}",
-                pid = pid,
-                quoted = quoted,
-            );
-            let _ = Command::new("/bin/sh").arg("-c").arg(cmd).spawn();
+        match current_app_bundle_path() {
+            Some(bundle) => {
+                let pid = std::process::id();
+                let quoted = shell_quote_path(&bundle);
+                // The relauncher runs AFTER this process exits, so the Rust
+                // logger is gone by the time `open` runs. Have the script append
+                // its own outcome (open's exit code) to the desktop log so a
+                // field failure is diagnosable instead of silent. A non-zero rc
+                // points at the launch itself (Gatekeeper, App Translocation,
+                // a missing/stale bundle); rc=0 with no relaunch points at the
+                // freshly-installed build crashing on its own startup.
+                let log_quoted = shell_quote_path(&logging::log_path());
+                log::info!("restart_app: relaunching via `open -n` against bundle {bundle:?}");
+                let cmd = format!(
+                    "alive=1; \
+                     for i in $(seq 1 100); do \
+                       if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
+                       sleep 0.1; \
+                     done; \
+                     if [ \"$alive\" = 1 ]; then kill -9 {pid} 2>/dev/null; sleep 0.5; fi; \
+                     /usr/bin/open -n {quoted}; rc=$?; \
+                     echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {quoted} exited rc=$rc (alive=$alive)\" >> {log_quoted}",
+                    pid = pid,
+                    quoted = quoted,
+                    log_quoted = log_quoted,
+                );
+                match Command::new("/bin/sh").arg("-c").arg(cmd).spawn() {
+                    Ok(_) => log::info!("restart_app: relauncher spawned"),
+                    Err(err) => log::error!("restart_app: failed to spawn relauncher: {err}"),
+                }
+            }
+            None => {
+                // No enclosing .app bundle (dev build, or an app launched from a
+                // path with no `.app` ancestor). `open -n` has nothing to target;
+                // the app will quit without relaunching.
+                log::error!(
+                    "restart_app: current_app_bundle_path() returned None (current_exe={:?}); cannot relaunch",
+                    std::env::current_exe()
+                );
+            }
         }
     }
 
@@ -3767,6 +3792,11 @@ fn spawn_proxy_watchdog(app: AppHandle) {
         // to the permanent give-up path instead. Resets when the proxy
         // recovers so a later hang triggers another rescue attempt.
         let mut hung_kill_attempted = false;
+        // Fire the one-shot Kompress model prefetch the first time we observe a
+        // healthy proxy this launch. `maybe_prefetch_kompress` is itself guarded
+        // and no-ops when the model is already cached; this flag just avoids
+        // spawning a throwaway thread on every subsequent tick.
+        let mut kompress_prefetch_spawned = false;
 
         loop {
             std::thread::sleep(POLL);
@@ -3816,6 +3846,14 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 // End of "down episode" — re-arm Sentry capture so a future
                 // crash fires a fresh event.
                 WATCHDOG_DOWN_CAPTURED.store(false, Ordering::Release);
+                if !kompress_prefetch_spawned {
+                    kompress_prefetch_spawned = true;
+                    let app_clone = app.clone();
+                    std::thread::spawn(move || {
+                        let state: tauri::State<'_, AppState> = app_clone.state();
+                        state.maybe_prefetch_kompress();
+                    });
+                }
                 continue;
             }
 

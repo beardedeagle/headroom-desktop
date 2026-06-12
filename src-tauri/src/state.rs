@@ -524,6 +524,10 @@ pub struct AppState {
     /// (blocking HTTP) plus a handful of file stats. A short TTL dedupes
     /// the work across all those callers without any visible lag.
     cached_runtime_status: Mutex<Option<(RuntimeStatus, Instant)>>,
+    /// Set once we've kicked off (or skipped) the one-shot Kompress model
+    /// prefetch for this app launch, so `maybe_prefetch_kompress` never fires
+    /// the ~260MB download more than once per process.
+    kompress_prefetch_attempted: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -618,6 +622,7 @@ impl AppState {
             cached_claude_code_projects: Mutex::new(None),
             cached_headroom_learn_prereq: Mutex::new(None),
             cached_runtime_status: Mutex::new(None),
+            kompress_prefetch_attempted: AtomicBool::new(false),
         };
 
         Ok(state)
@@ -2769,6 +2774,91 @@ impl AppState {
                 log::warn!("failed to clean detached headroom proxy processes: {err}");
             }
         }
+    }
+
+    /// One-shot, best-effort prefetch of the Kompress ML model on a fresh
+    /// install. Blocks (run on a background thread) — downloads the ~260MB
+    /// model the proxy would otherwise fetch lazily on first request, so a new
+    /// user has ML compression ready before any traffic and never sees a
+    /// lingering "Kompress disabled" banner.
+    ///
+    /// Skips immediately (no work) when: already attempted this launch, the
+    /// runtime isn't installed/reachable, the `[ml]` extras aren't installed,
+    /// the model is already cached, or Kompress already reports enabled.
+    ///
+    /// On a successful download, if the proxy has been idle (no recent
+    /// proxy-log activity) it does one graceful restart so startup eager-load
+    /// re-reports `Kompress: ENABLED`. If the proxy is actively serving, it
+    /// skips the restart — `headroom_kompress_enabled` detects the lazy-load
+    /// marker on the next request instead, so the status still flips on its own.
+    pub fn maybe_prefetch_kompress(&self) {
+        // One-shot guard: claim the attempt; bail if another call already did.
+        if self
+            .kompress_prefetch_attempted
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        if !self.tool_manager.python_runtime_installed() || !is_headroom_proxy_reachable() {
+            return;
+        }
+        // Only meaningful when the ML extras are present but the model isn't
+        // loaded yet. If ml isn't installed, prefetch can't help; if Kompress
+        // already reports enabled, there's nothing to do.
+        if self.tool_manager.headroom_ml_installed() != Some(true) {
+            return;
+        }
+        if self.tool_manager.kompress_model_cached()
+            || self.tool_manager.headroom_kompress_enabled() == Some(true)
+        {
+            return;
+        }
+
+        log::info!("kompress prefetch: downloading model on fresh install");
+        let downloaded = match self.tool_manager.prefetch_kompress_model() {
+            Ok(ok) => ok,
+            Err(err) => {
+                log::warn!("kompress prefetch failed: {err:#}");
+                return;
+            }
+        };
+        if !downloaded {
+            log::warn!("kompress prefetch exited non-zero; see logs/kompress-prefetch.log");
+            return;
+        }
+        log::info!("kompress prefetch: model cached");
+
+        // Invalidate the runtime-status cache so the freshly-cached state is
+        // reflected on the next poll regardless of the restart decision.
+        *self.cached_runtime_status.lock() = None;
+
+        // Surface "enabled" proactively only when safe: a restart drops any
+        // in-flight request, so we require the proxy to be idle first.
+        if self.runtime_is_paused() || self.runtime_is_starting() {
+            return;
+        }
+        let idle = newest_proxy_log_mtime(&self.tool_manager.logs_dir())
+            .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
+            .map(|age| age >= std::time::Duration::from_secs(20))
+            .unwrap_or(true);
+        if !idle {
+            log::info!("kompress prefetch: proxy busy, deferring restart to lazy-load detection");
+            return;
+        }
+
+        log::info!("kompress prefetch: restarting proxy to load cached model");
+        self.stop_headroom();
+        if let Err(err) = self.ensure_headroom_running() {
+            log::warn!("kompress prefetch: restart after download failed: {err:#}");
+        }
+        *self.cached_runtime_status.lock() = None;
     }
 
     fn pricing_allows_optimization(&self) -> bool {

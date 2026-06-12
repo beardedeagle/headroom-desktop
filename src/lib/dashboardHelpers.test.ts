@@ -18,6 +18,7 @@ import {
   getEnabledSupportedConnectors,
   hasEnabledConnector,
   hourOfDayTickFormatter,
+  mergeProviderSavingsForDisplay,
   percent1,
   sortClientConnectors
 } from "./dashboardHelpers";
@@ -223,5 +224,69 @@ describe("dashboard helpers", () => {
     expect(formatLearnStatus({ lastLearnRanAt: "2026-03-27T08:00:00Z" })).toBe("last scan: today");
     expect(formatLearnStatus({ lastLearnRanAt: "2026-03-26T08:00:00Z" })).toBe("last scan: yesterday");
     expect(formatLearnStatus({ lastLearnRanAt: "2026-03-22T08:00:00Z" })).toBe("last scan: 5 days ago");
+  });
+});
+
+describe("mergeProviderSavingsForDisplay", () => {
+  it("folds anthropic and unknown into Claude Code (listed first) and openai into Codex", () => {
+    const merged = mergeProviderSavingsForDisplay([
+      {
+        provider: "openai",
+        estimatedSavingsUsd: 0.04,
+        estimatedTokensSaved: 40,
+        actualCostUsd: 0.16,
+        totalTokensSent: 80
+      },
+      {
+        provider: "anthropic",
+        estimatedSavingsUsd: 0.1,
+        estimatedTokensSaved: 100,
+        actualCostUsd: 0.24,
+        totalTokensSent: 120
+      },
+      {
+        provider: "unknown",
+        estimatedSavingsUsd: 0.01,
+        estimatedTokensSaved: 15,
+        actualCostUsd: 0.03,
+        totalTokensSent: 20
+      }
+    ]);
+
+    expect(merged).toEqual([
+      {
+        label: "Claude Code",
+        estimatedSavingsUsd: 0.1 + 0.01,
+        estimatedTokensSaved: 115,
+        actualCostUsd: 0.24 + 0.03,
+        totalTokensSent: 140
+      },
+      {
+        label: "Codex",
+        estimatedSavingsUsd: 0.04,
+        estimatedTokensSaved: 40,
+        actualCostUsd: 0.16,
+        totalTokensSent: 80
+      }
+    ]);
+  });
+
+  it("omits a connector with no attributed providers", () => {
+    const merged = mergeProviderSavingsForDisplay([
+      {
+        provider: "anthropic",
+        estimatedSavingsUsd: 0.1,
+        estimatedTokensSaved: 100,
+        actualCostUsd: 0.24,
+        totalTokensSent: 120
+      }
+    ]);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].label).toBe("Claude Code");
+  });
+
+  it("returns nothing for an empty breakdown", () => {
+    expect(mergeProviderSavingsForDisplay([])).toEqual([]);
   });
 });

@@ -183,6 +183,54 @@ export function buildMonthlySavingsChartData(data: DailySavingsPoint[]): Savings
   }));
 }
 
+export interface ProviderSavingsDisplay {
+  label: string;
+  estimatedSavingsUsd: number;
+  estimatedTokensSaved: number;
+  actualCostUsd: number;
+  totalTokensSent: number;
+}
+
+// Fold the upstream per-provider breakdown into the two connectors the desktop
+// supports. Anything that isn't OpenAI/Codex is attributed to Claude Code,
+// including legacy "unknown" buckets from before per-provider attribution
+// existed (a period when Codex wasn't supported, so all traffic was Claude).
+// Claude Code is listed first. A group is shown only if at least one source
+// provider mapped into it.
+export function mergeProviderSavingsForDisplay(
+  byProvider: ProviderSavingsPoint[]
+): ProviderSavingsDisplay[] {
+  const groups = {
+    claude: {
+      label: "Claude Code",
+      count: 0,
+      estimatedSavingsUsd: 0,
+      estimatedTokensSaved: 0,
+      actualCostUsd: 0,
+      totalTokensSent: 0
+    },
+    codex: {
+      label: "Codex",
+      count: 0,
+      estimatedSavingsUsd: 0,
+      estimatedTokensSaved: 0,
+      actualCostUsd: 0,
+      totalTokensSent: 0
+    }
+  };
+  for (const point of byProvider) {
+    const group = point.provider.toLowerCase() === "openai" ? groups.codex : groups.claude;
+    group.count += 1;
+    group.estimatedSavingsUsd += point.estimatedSavingsUsd;
+    group.estimatedTokensSaved += point.estimatedTokensSaved;
+    group.actualCostUsd += point.actualCostUsd;
+    group.totalTokensSent += point.totalTokensSent;
+  }
+  return [groups.claude, groups.codex]
+    .filter((group) => group.count > 0)
+    .map(({ count: _count, ...display }) => display);
+}
+
 export function buildHourlySavingsChartData(data: HourlySavingsPoint[]): SavingsChartDatum[] {
   return data.map((point) => ({
     bucketKey: point.hour,

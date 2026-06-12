@@ -176,14 +176,14 @@ pub fn init() -> Result<PathBuf, SetLoggerError> {
 }
 
 #[cfg(target_os = "macos")]
-fn log_path() -> PathBuf {
+pub(crate) fn log_path() -> PathBuf {
     dirs::home_dir()
         .map(|h| h.join("Library/Logs/Headroom/headroom-desktop.log"))
         .unwrap_or_else(|| PathBuf::from("/tmp/headroom-desktop.log"))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn log_path() -> PathBuf {
+pub(crate) fn log_path() -> PathBuf {
     dirs::data_local_dir()
         .map(|d| d.join("headroom/headroom-desktop.log"))
         .unwrap_or_else(|| std::env::temp_dir().join("headroom-desktop.log"))

@@ -836,18 +836,18 @@ impl ToolManager {
     fn latest_tool_log_marker_state(
         &self,
         tool_id: &str,
-        enabled_marker: &str,
+        enabled_markers: &[&str],
         disabled_markers: &[&str],
     ) -> Option<bool> {
         let path = self.latest_tool_log_path(tool_id)?;
-        self.scan_file_for_marker_state_cached(tool_id, &path, enabled_marker, disabled_markers)
+        self.scan_file_for_marker_state_cached(tool_id, &path, enabled_markers, disabled_markers)
     }
 
     fn scan_file_for_marker_state_cached(
         &self,
         cache_key: &str,
         path: &Path,
-        enabled_marker: &str,
+        enabled_markers: &[&str],
         disabled_markers: &[&str],
     ) -> Option<bool> {
         let modified = std::fs::metadata(path).ok()?.modified().ok()?;
@@ -867,7 +867,10 @@ impl ToolManager {
         let mut result: Option<bool> = None;
         for line in content.lines().rev() {
             let lowered = line.to_ascii_lowercase();
-            if lowered.contains(enabled_marker) {
+            if enabled_markers
+                .iter()
+                .any(|marker| lowered.contains(marker))
+            {
                 result = Some(true);
                 break;
             }
@@ -930,12 +933,24 @@ impl ToolManager {
         // our Tauri-spawned log captures. Probe that file first; fall back to
         // the spawn-time tool log (covers older headroom versions that do
         // propagate to stderr).
+        // Positive markers: the startup `Kompress: ENABLED` line (cache hit at
+        // eager-preload) AND the lazy-load success lines emitted on first use
+        // when the model was downloaded after a cold-cache startup. The scan
+        // returns the most recent marker, so a lazy load flips the status to
+        // enabled without waiting for a backend restart.
+        const KOMPRESS_ENABLED_MARKERS: &[&str] = &[
+            "kompress: enabled",
+            "kompress onnx loaded",
+            "kompress pytorch loaded",
+        ];
+        const KOMPRESS_DISABLED_MARKERS: &[&str] =
+            &["kompress: not installed", "kompress: disabled"];
         if let Some(path) = headroom_propagated_proxy_log_path() {
             if let Some(state) = self.scan_file_for_marker_state_cached(
                 "headroom-proxy-log",
                 &path,
-                "kompress: enabled",
-                &["kompress: not installed", "kompress: disabled"],
+                KOMPRESS_ENABLED_MARKERS,
+                KOMPRESS_DISABLED_MARKERS,
             ) {
                 return Some(state);
             }
@@ -943,9 +958,75 @@ impl ToolManager {
 
         self.latest_tool_log_marker_state(
             "headroom",
-            "kompress: enabled",
-            &["kompress: not installed", "kompress: disabled"],
+            KOMPRESS_ENABLED_MARKERS,
+            KOMPRESS_DISABLED_MARKERS,
         )
+    }
+
+    /// True if the Kompress model snapshot is already present in the
+    /// HuggingFace hub cache (`$HOME/.cache/huggingface/hub/
+    /// models--chopratejas--kompress-v2-base/snapshots/<rev>`). Used as the
+    /// prefetch idempotency guard so we never re-download an existing model.
+    pub fn kompress_model_cached(&self) -> bool {
+        let Some(home) = dirs::home_dir() else {
+            return false;
+        };
+        let snapshots = home
+            .join(".cache")
+            .join("huggingface")
+            .join("hub")
+            .join("models--chopratejas--kompress-v2-base")
+            .join("snapshots");
+        std::fs::read_dir(&snapshots)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
+    }
+
+    /// Download the Kompress model (~260MB) into the HF cache by running the
+    /// bundled venv python's loader with network enabled. Blocks until the
+    /// download finishes — call this on a background thread. Output is captured
+    /// to `logs/kompress-prefetch.log`. Returns `Ok(true)` on success.
+    ///
+    /// This front-loads the download the proxy would otherwise do lazily on
+    /// first request, so a fresh install has ML compression ready before any
+    /// traffic. It is best-effort: on failure the proxy's own lazy-load path
+    /// still downloads on first use.
+    pub fn prefetch_kompress_model(&self) -> Result<bool> {
+        let python = self.managed_python();
+        if !python.exists() {
+            bail!("headroom managed python not found at {}", python.display());
+        }
+        let logs_dir = self.runtime.logs_dir();
+        std::fs::create_dir_all(&logs_dir)
+            .with_context(|| format!("creating {}", logs_dir.display()))?;
+        let log_path = logs_dir.join("kompress-prefetch.log");
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("opening {}", log_path.display()))?;
+
+        let status = Command::new(&python)
+            .arg("-c")
+            .arg(
+                "from headroom.transforms.kompress_compressor import load_kompress_model; \
+                 load_kompress_model(allow_download=True)",
+            )
+            .current_dir(&self.runtime.root_dir)
+            .env("PYTHONNOUSERSITE", "1")
+            .env("PYTHONUNBUFFERED", "1")
+            // Same xet guard as the proxy spawn: the native hf_xet downloader
+            // can SIGABRT mid-pull; the HTTPS fallback is stable.
+            .env("HF_HUB_DISABLE_XET", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file.try_clone().with_context(|| {
+                format!("cloning {}", log_path.display())
+            })?))
+            .stderr(Stdio::from(log_file))
+            .status()
+            .with_context(|| format!("running kompress prefetch via {}", python.display()))?;
+
+        Ok(status.success())
     }
 
     fn read_headroom_receipt(&self) -> Option<Value> {
@@ -4655,6 +4736,49 @@ mod tests {
         assert!(runtime.standalone_python().starts_with(&runtime.root_dir));
         assert!(runtime.managed_pip().starts_with(&runtime.root_dir));
         assert!(runtime.bin_dir.starts_with(&runtime.root_dir));
+    }
+
+    #[test]
+    fn kompress_marker_scan_treats_lazy_load_as_enabled() {
+        let (root, runtime, manager) = seed_test_runtime("kompress-marker");
+        fs::create_dir_all(runtime.logs_dir()).expect("logs dir");
+        let enabled: &[&str] = &[
+            "kompress: enabled",
+            "kompress onnx loaded",
+            "kompress pytorch loaded",
+        ];
+        let disabled: &[&str] = &["kompress: not installed", "kompress: disabled"];
+
+        // Cold-cache startup logs "not installed"; a later first-use lazy load
+        // logs "Kompress ONNX loaded". The most-recent marker (lazy load) wins,
+        // so the desktop reports enabled without a restart.
+        let log = runtime.logs_dir().join("kompress-lazy.log");
+        fs::write(
+            &log,
+            "2026-06-12 10:00:00 - headroom.proxy - INFO - Kompress: not installed (pip install headroom-ai[ml])\n\
+             2026-06-12 10:05:00 - headroom.proxy - INFO - Kompress ONNX loaded: chopratejas/kompress-v2-base backend=onnx\n",
+        )
+        .expect("write lazy log");
+        assert_eq!(
+            manager.scan_file_for_marker_state_cached("k-lazy", &log, enabled, disabled),
+            Some(true),
+            "a lazy-load line after a not-installed line should report enabled"
+        );
+
+        // A pure cold-cache log (no lazy load yet) still reports disabled.
+        let log2 = runtime.logs_dir().join("kompress-cold.log");
+        fs::write(
+            &log2,
+            "2026-06-12 10:00:00 - headroom.proxy - INFO - Kompress: not installed (pip install headroom-ai[ml])\n",
+        )
+        .expect("write cold log");
+        assert_eq!(
+            manager.scan_file_for_marker_state_cached("k-cold", &log2, enabled, disabled),
+            Some(false),
+            "a not-installed line with no later load should report disabled"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

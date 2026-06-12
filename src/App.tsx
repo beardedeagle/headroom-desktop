@@ -102,6 +102,7 @@ import {
   getEnabledSupportedConnectors,
   hasEnabledConnector,
   hourOfDayTickFormatter,
+  mergeProviderSavingsForDisplay,
   percent1,
   sortClientConnectors,
   startOfDay,
@@ -275,21 +276,6 @@ async function loadDashboard(): Promise<DashboardState> {
   }
 }
 
-// Upstream `by_provider` keys are upstream provider ids; map to the connector
-// names the rest of the desktop uses. `unknown` covers pre-attribution buckets.
-function providerLabel(provider: string): string {
-  switch (provider.toLowerCase()) {
-    case "anthropic":
-      return "Claude";
-    case "openai":
-      return "Codex";
-    case "unknown":
-      return "Other";
-    default:
-      return provider.charAt(0).toUpperCase() + provider.slice(1);
-  }
-}
-
 function SavingsChartTooltip({
   active,
   payload,
@@ -304,67 +290,80 @@ function SavingsChartTooltip({
     return null;
   }
 
-  const byProvider = point.byProvider ?? [];
+  const providerSavings = mergeProviderSavingsForDisplay(point.byProvider ?? []);
 
   return (
     <div className="savings-chart__tooltip">
       <strong>{point.bucketLabel}</strong>
-      {chartMode === "usd" ? (
-        <div className="savings-chart__tooltip-group">
-          <span className="savings-chart__tooltip-label">Dollars</span>
-          <span className="savings-chart__tooltip-item">
-            <i
-              aria-hidden="true"
-              className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-usd"
-            />
-            Saved {currencyExact(point.estimatedSavingsUsd)}
-          </span>
-          <span className="savings-chart__tooltip-item">
-            <i
-              aria-hidden="true"
-              className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-usd"
-            />
-            Spent {currencyExact(point.actualCostUsd)}
-          </span>
-        </div>
-      ) : (
-        <div className="savings-chart__tooltip-group">
-          <span className="savings-chart__tooltip-label">Tokens</span>
-          <span className="savings-chart__tooltip-item">
-            <i
-              aria-hidden="true"
-              className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-tokens"
-            />
-            Saved {compactNumber(point.estimatedTokensSaved)} tokens
-          </span>
-          <span className="savings-chart__tooltip-item">
-            <i
-              aria-hidden="true"
-              className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-tokens"
-            />
-            Spent {compactNumber(point.totalTokensSent)} tokens
-          </span>
-        </div>
-      )}
-      {byProvider.length > 0 ? (
-        <div className="savings-chart__tooltip-group">
-          <span className="savings-chart__tooltip-label">By provider</span>
-          {byProvider.map((provider) => (
-            <span className="savings-chart__tooltip-item" key={provider.provider}>
+      {providerSavings.length > 0
+        ? // Hourly buckets carry per-provider attribution: show Saved/Spent per
+          // connector instead of the bucket total (which would be redundant).
+          providerSavings.map((provider) => (
+            <div className="savings-chart__tooltip-group" key={provider.label}>
+              <span className="savings-chart__tooltip-label">{provider.label}</span>
+              <span className="savings-chart__tooltip-item">
+                <i
+                  aria-hidden="true"
+                  className={`savings-chart__tooltip-dot savings-chart__tooltip-dot--${
+                    chartMode === "usd" ? "saved-usd" : "saved-tokens"
+                  }`}
+                />
+                {chartMode === "usd"
+                  ? `Saved ${currencyExact(provider.estimatedSavingsUsd)}`
+                  : `Saved ${compactNumber(provider.estimatedTokensSaved)} tokens`}
+              </span>
+              <span className="savings-chart__tooltip-item">
+                <i
+                  aria-hidden="true"
+                  className={`savings-chart__tooltip-dot savings-chart__tooltip-dot--${
+                    chartMode === "usd" ? "actual-usd" : "actual-tokens"
+                  }`}
+                />
+                {chartMode === "usd"
+                  ? `Spent ${currencyExact(provider.actualCostUsd)}`
+                  : `Spent ${compactNumber(provider.totalTokensSent)} tokens`}
+              </span>
+            </div>
+          ))
+        : // Monthly buckets (and pre-attribution hourly buckets) have no provider
+          // dimension: fall back to the aggregate bucket total.
+        chartMode === "usd" ? (
+          <div className="savings-chart__tooltip-group">
+            <span className="savings-chart__tooltip-label">Dollars</span>
+            <span className="savings-chart__tooltip-item">
               <i
                 aria-hidden="true"
-                className={`savings-chart__tooltip-dot savings-chart__tooltip-dot--${
-                  chartMode === "usd" ? "saved-usd" : "saved-tokens"
-                }`}
+                className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-usd"
               />
-              {providerLabel(provider.provider)}{" "}
-              {chartMode === "usd"
-                ? `saved ${currencyExact(provider.estimatedSavingsUsd)}`
-                : `saved ${compactNumber(provider.estimatedTokensSaved)} tokens`}
+              Saved {currencyExact(point.estimatedSavingsUsd)}
             </span>
-          ))}
-        </div>
-      ) : null}
+            <span className="savings-chart__tooltip-item">
+              <i
+                aria-hidden="true"
+                className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-usd"
+              />
+              Spent {currencyExact(point.actualCostUsd)}
+            </span>
+          </div>
+        ) : (
+          <div className="savings-chart__tooltip-group">
+            <span className="savings-chart__tooltip-label">Tokens</span>
+            <span className="savings-chart__tooltip-item">
+              <i
+                aria-hidden="true"
+                className="savings-chart__tooltip-dot savings-chart__tooltip-dot--saved-tokens"
+              />
+              Saved {compactNumber(point.estimatedTokensSaved)} tokens
+            </span>
+            <span className="savings-chart__tooltip-item">
+              <i
+                aria-hidden="true"
+                className="savings-chart__tooltip-dot savings-chart__tooltip-dot--actual-tokens"
+              />
+              Spent {compactNumber(point.totalTokensSent)} tokens
+            </span>
+          </div>
+        )}
     </div>
   );
 }
@@ -3710,6 +3709,18 @@ export default function App() {
     );
   }
 
+  // Cold-cache warmup: proxy is up and the ML extras are installed, but the
+  // ~260MB Kompress model hasn't loaded yet (it downloads lazily on first use,
+  // and the desktop prefetches it in the background after a fresh install).
+  // This is normal setup, not a fault, so it must not surface as an issue.
+  const kompressWarming = Boolean(
+    runtimeStatus &&
+      runtimeStatus.running &&
+      runtimeStatus.proxyReachable &&
+      runtimeStatus.mlInstalled !== false &&
+      runtimeStatus.kompressEnabled === false
+  );
+
   const runtimeIssues: string[] = [];
   if (runtimeStatus?.installed === false) {
     runtimeIssues.push("runtime not installed");
@@ -3727,7 +3738,7 @@ export default function App() {
   if (runtimeStatus?.mcpConfigured === false) {
     runtimeIssues.push("MCP not configured");
   }
-  if (runtimeStatus?.kompressEnabled === false) {
+  if (runtimeStatus?.kompressEnabled === false && !kompressWarming) {
     runtimeIssues.push("Kompress disabled");
   }
 
@@ -3736,7 +3747,7 @@ export default function App() {
       runtimeStatus.running &&
       runtimeStatus.proxyReachable &&
       runtimeStatus.mcpConfigured !== false &&
-      runtimeStatus.kompressEnabled !== false
+      (runtimeStatus.kompressEnabled !== false || kompressWarming)
   );
   const platformPreviewNotice =
     runtimeStatus?.supportTier === "experimental"
@@ -3820,6 +3831,12 @@ export default function App() {
         return {
           tone: "starting",
           title: "Send a message in a connected tool to verify the connection is working. You may need to restart it first."
+        } as const;
+      }
+      if (kompressWarming) {
+        return {
+          tone: "healthy",
+          title: "Headroom is running. Finishing setup - downloading the compression model."
         } as const;
       }
       return {
@@ -5082,12 +5099,14 @@ export default function App() {
                       },
                       {
                         name: "Kompress",
-                        ok:
-                          runtimeStatus?.kompressEnabled === true
+                        ok: kompressWarming
+                          ? null
+                          : runtimeStatus?.kompressEnabled === true
                             ? true
                             : runtimeStatus?.kompressEnabled === false
                               ? false
                               : null,
+                        suffix: kompressWarming ? "warming up" : undefined,
                       },
                     ] as { name: string; ok: boolean | null; suffix?: string; onClick?: () => void }[]).map((s) => {
                       const indicatorClass =
