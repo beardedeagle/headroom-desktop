@@ -149,8 +149,6 @@ import type {
   ClaudePlanTier,
   HeadroomAuthCodeRequest,
   HeadroomPricingStatus,
-  CodexUsage,
-  CodexUsageWindow,
   ClaudeCodeProject,
   ClientConnectorStatus,
   ClientSetupResult,
@@ -614,72 +612,6 @@ function DailySavingsChart({
 
 function renderConnectorLogo(clientId: string) {
   return <Sparkle className="client-logo__glyph" size={20} weight="duotone" />;
-}
-
-function renderCodexUsageWindow(label: string, window: CodexUsageWindow) {
-  const pct = Math.max(0, Math.min(100, window.usedPercent));
-  const windowLabel = window.windowLabel ? `${label} (${window.windowLabel})` : label;
-  return (
-    <div className="codex-usage__row" key={label}>
-      <div className="codex-usage__row-head">
-        <span className="codex-usage__label">{windowLabel}</span>
-        <span className="codex-usage__value">{Math.round(pct)}%</span>
-      </div>
-      <div
-        className="codex-usage__bar"
-        role="progressbar"
-        aria-valuenow={Math.round(pct)}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-label={`${windowLabel} usage`}
-      >
-        <span className="codex-usage__bar-fill" style={{ width: `${pct}%` }} />
-      </div>
-    </div>
-  );
-}
-
-function renderCodexUsage(
-  codex: CodexUsage | null | undefined,
-  onUpgrade: (planId: UpgradePlanId) => void
-) {
-  if (!codex || (!codex.primary && !codex.secondary)) {
-    return (
-      <div className="codex-usage codex-usage--empty">
-        <p className="codex-usage__title">Subscription usage</p>
-        <p className="codex-usage__hint">
-          Send a Codex prompt through Headroom to sync your current usage window.
-        </p>
-      </div>
-    );
-  }
-  const paused = codex.optimizationAllowed === false;
-  const showNudge = paused || codex.shouldNudge;
-  const upgradePlanId = (codex.recommendedSubscriptionTier ?? "pro") as UpgradePlanId;
-  return (
-    <div className="codex-usage">
-      <p className="codex-usage__title">Subscription usage</p>
-      {codex.primary ? renderCodexUsageWindow("Primary", codex.primary) : null}
-      {codex.secondary ? renderCodexUsageWindow("Secondary", codex.secondary) : null}
-      {codex.creditsBalance ? (
-        <p className="codex-usage__credits">
-          Credits: {codex.creditsUnlimited ? "unlimited" : codex.creditsBalance}
-        </p>
-      ) : null}
-      {showNudge ? (
-        <div className={`codex-usage__nudge${paused ? " codex-usage__nudge--paused" : ""}`}>
-          <p className="codex-usage__nudge-text">{codex.gateMessage}</p>
-          <button
-            type="button"
-            className="codex-usage__nudge-action"
-            onClick={() => onUpgrade(upgradePlanId)}
-          >
-            Upgrade
-          </button>
-        </div>
-      ) : null}
-    </div>
-  );
 }
 
 function buildUpgradeIssueMailto(failure: RuntimeUpgradeFailure): string {
@@ -3836,7 +3768,7 @@ export default function App() {
       if (kompressWarming) {
         return {
           tone: "healthy",
-          title: "Headroom is running. Finishing setup - downloading the compression model."
+          title: "Headroom is running while finishing setup."
         } as const;
       }
       return {
@@ -5004,11 +4936,6 @@ export default function App() {
                               {detectionWarning ?? unavailableReason}
                             </p>
                           ) : null}
-                          {connector.clientId === "codex" && connector.enabled
-                            ? renderCodexUsage(pricingStatus?.codex, (planId) =>
-                                void handleUpgradeAction(planId)
-                              )
-                            : null}
                         </div>
                         <div className="connector-item__controls">
                           <button
