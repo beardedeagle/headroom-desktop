@@ -685,6 +685,8 @@ export default function App() {
   const [proxyVerificationHint, setProxyVerificationHint] = useState<string | null>(null);
   const proxyVerificationRequestAnchorRef = useRef<number | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
+  const [resuming, setResuming] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
   const [appUpdateConfig, setAppUpdateConfig] = useState<AppUpdateConfiguration | null>(null);
   const [appUpdateAvailable, setAppUpdateAvailable] = useState<AvailableAppUpdate | null>(null);
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
@@ -2226,6 +2228,24 @@ export default function App() {
     }
   }
 
+  async function handleResumeRuntime() {
+    if (resuming) {
+      return;
+    }
+    setResuming(true);
+    setResumeError(null);
+    try {
+      await invoke("force_restart_headroom");
+      await refreshRuntimeStatus();
+    } catch (error) {
+      setResumeError(
+        error instanceof Error ? error.message : "Could not restart Headroom."
+      );
+    } finally {
+      setResuming(false);
+    }
+  }
+
   async function refreshPricingStatus() {
     if (pricingRefreshInFlightRef.current) {
       return;
@@ -3701,6 +3721,12 @@ export default function App() {
     }
 
     if (runtimeStatus.paused) {
+      if (runtimeStatus.autoPaused) {
+        return {
+          tone: "auto-paused",
+          title: "Headroom stopped unexpectedly. Traffic is passing through unoptimized."
+        } as const;
+      }
       return {
         tone: "paused",
         title: "Headroom is paused."
@@ -4159,6 +4185,23 @@ export default function App() {
                 ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
                   <p className="callout-banner__subtitle">Now use your connected tools as normal, and check back later to see how much you are saving by using Headroom.</p>
+                )}
+                {(calloutBanner.tone === "auto-paused" || calloutBanner.tone === "paused") && (
+                  <div className="callout-banner__resume">
+                    <button
+                      type="button"
+                      className="callout-banner__action"
+                      onClick={() => void handleResumeRuntime()}
+                      disabled={resuming}
+                    >
+                      {resuming ? "Restarting…" : "Resume"}
+                    </button>
+                    {resumeError ? (
+                      <p className="callout-banner__subtitle callout-banner__error" role="status">
+                        {resumeError}
+                      </p>
+                    ) : null}
+                  </div>
                 )}
               </div>
               {(() => {

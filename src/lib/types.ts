@@ -163,6 +163,10 @@ export interface RuntimeStatus {
   running: boolean;
   starting: boolean;
   paused: boolean;
+  /** True when the watchdog auto-paused after giving up on a wedged proxy,
+   *  distinct from a deliberate user pause. Drives the "stopped unexpectedly"
+   *  banner + Resume button. */
+  autoPaused: boolean;
   proxyReachable: boolean;
   headroomPid?: number | null;
   mcpConfigured?: boolean | null;

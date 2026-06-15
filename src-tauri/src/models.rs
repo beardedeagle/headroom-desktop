@@ -247,6 +247,10 @@ pub struct RuntimeStatus {
     pub running: bool,
     pub starting: bool,
     pub paused: bool,
+    /// True when the watchdog auto-paused after giving up on a wedged proxy,
+    /// distinct from a deliberate user pause. Drives the "stopped unexpectedly"
+    /// banner + Resume button.
+    pub auto_paused: bool,
     pub proxy_reachable: bool,
     pub headroom_pid: Option<u32>,
     pub mcp_configured: Option<bool>,

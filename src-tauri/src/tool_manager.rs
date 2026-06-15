@@ -626,6 +626,16 @@ impl ToolManager {
                     .env("HF_HUB_DISABLE_XET", "1")
                     .env("HEADROOM_SDK", "headroom-desktop-proxy")
                     .env("HEADROOM_HTTP2", "false")
+                    // Disable the HTTP/1.1 keep-alive pool for the upstream
+                    // (proxy -> api.anthropic.com) client. Claude Code cancels
+                    // streaming requests constantly (ESC, aborted tool calls,
+                    // subagent cancellations), which can leave a pooled TLS
+                    // connection desynced; reusing it surfaces as
+                    // "SSLV3_ALERT_BAD_RECORD_MAC" on the next request. The
+                    // proxy's retry path does not catch SSL/RemoteProtocolError,
+                    // so the raw error leaks back to the client. Fresh
+                    // connection per request avoids reuse of a poisoned socket.
+                    .env("HEADROOM_MAX_KEEPALIVE", "0")
                     // Optimization mode. Always token: maximize raw-token savings via
                     // prior-turn compression. (Cache mode and the auth-based auto-switch
                     // were removed; cache mode contributed no measurable savings over

@@ -74,6 +74,7 @@ function makeRuntime(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
     running: true,
     starting: false,
     paused: false,
+    autoPaused: false,
     proxyReachable: true,
     headroomLearnSupported: true,
     rtk: {

@@ -504,6 +504,8 @@ pub fn perform_full_cleanup() -> Vec<String> {
         removed.extend(remove_macos_launch_agents());
         removed.extend(remove_macos_preferences());
         removed.extend(remove_macos_caches());
+        removed.extend(remove_macos_logs());
+        removed.extend(remove_macos_bundle_dirs());
     }
 
     remove_known_keychain_entries();
@@ -698,6 +700,51 @@ fn remove_macos_caches() -> Vec<String> {
         match std::fs::remove_dir_all(&caches_dir) {
             Ok(_) => removed.push(caches_dir.display().to_string()),
             Err(err) => log::warn!("cleanup: removing {} failed: {err}", caches_dir.display()),
+        }
+    }
+    removed
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_logs() -> Vec<String> {
+    let mut removed = Vec::new();
+    let logs_dir = home_dir().join("Library").join("Logs").join("Headroom");
+    if logs_dir.exists() {
+        match std::fs::remove_dir_all(&logs_dir) {
+            Ok(_) => removed.push(logs_dir.display().to_string()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", logs_dir.display()),
+        }
+    }
+    removed
+}
+
+/// Sweep the per-bundle-id directories macOS creates for a GUI app outside the
+/// Caches/Preferences locations already handled above: the WKWebView data
+/// store, HTTP cookie/storage caches, and saved window state.
+#[cfg(target_os = "macos")]
+fn remove_macos_bundle_dirs() -> Vec<String> {
+    let mut removed = Vec::new();
+    let lib = home_dir().join("Library");
+    let targets = [
+        lib.join("WebKit").join("com.extraheadroom.headroom"),
+        lib.join("HTTPStorages").join("com.extraheadroom.headroom"),
+        lib.join("HTTPStorages")
+            .join("com.extraheadroom.headroom.binarycookies"),
+        lib.join("Saved Application State")
+            .join("com.extraheadroom.headroom.savedState"),
+    ];
+    for path in targets {
+        if !path.exists() {
+            continue;
+        }
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(_) => removed.push(path.display().to_string()),
+            Err(err) => log::warn!("cleanup: removing {} failed: {err}", path.display()),
         }
     }
     removed

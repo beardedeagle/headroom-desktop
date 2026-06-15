@@ -432,6 +432,13 @@ pub struct AppState {
     /// `run_upgrade_with_ui` tries `try_lock` and bails if already held.
     upgrade_lock: Mutex<()>,
     pub runtime_paused: Mutex<bool>,
+    /// True when the watchdog auto-paused the runtime after giving up on
+    /// restarting a wedged/unreachable proxy — as opposed to a deliberate
+    /// user pause (`runtime_paused` with this false). Drives the self-heal
+    /// auto-resume loop (only auto-paused runtimes are retried) and the
+    /// "stopped unexpectedly" banner. Cleared by any successful resume and by
+    /// an explicit user pause.
+    pub runtime_auto_paused: AtomicBool,
     pub runtime_starting: Mutex<bool>,
     /// True while an atomic runtime upgrade is running (install + boot validation).
     /// Gates the watchdog from auto-pausing during the ~minutes-long upgrade.
@@ -564,6 +571,7 @@ impl AppState {
             lifecycle_lock: Mutex::new(()),
             upgrade_lock: Mutex::new(()),
             runtime_paused: Mutex::new(false),
+            runtime_auto_paused: AtomicBool::new(false),
             runtime_starting: Mutex::new(false),
             runtime_upgrade_in_progress: Mutex::new(false),
             runtime_upgrade_progress: Mutex::new(RuntimeUpgradeProgress {
@@ -2603,6 +2611,7 @@ impl AppState {
     fn compute_runtime_status(&self) -> RuntimeStatus {
         let installed = self.tool_manager.python_runtime_installed();
         let paused = self.runtime_is_paused();
+        let auto_paused = self.runtime_is_auto_paused();
         let proxy_reachable = is_headroom_proxy_reachable();
         let mcp_configured = self.tool_manager.headroom_mcp_configured();
         let mcp_error = self.tool_manager.headroom_mcp_error();
@@ -2647,6 +2656,7 @@ impl AppState {
             running: effective_running,
             starting: self.runtime_is_starting() && !effective_running,
             paused,
+            auto_paused,
             proxy_reachable,
             headroom_pid,
             mcp_configured,
@@ -2681,6 +2691,17 @@ impl AppState {
         *self.runtime_paused.lock()
     }
 
+    pub fn set_runtime_auto_paused(&self, auto_paused: bool) {
+        self.runtime_auto_paused
+            .store(auto_paused, std::sync::atomic::Ordering::Release);
+        self.invalidate_runtime_status_cache();
+    }
+
+    pub fn runtime_is_auto_paused(&self) -> bool {
+        self.runtime_auto_paused
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn set_runtime_starting(&self, starting: bool) {
         let mut runtime_starting = self.runtime_starting.lock();
         *runtime_starting = starting;
@@ -2703,6 +2724,10 @@ impl AppState {
 
     pub fn resume_runtime(&self) -> Result<()> {
         self.set_runtime_paused(false);
+        // Any successful resume clears the auto-pause flag so the self-heal
+        // loop stops retrying and the banner drops the "stopped unexpectedly"
+        // framing.
+        self.set_runtime_auto_paused(false);
         // User explicitly resuming = "go back to optimizing." Clear bypass
         // so `ensure_headroom_running` doesn't short-circuit on the bypass
         // check (state.rs ~2247). If pricing still says we're gated, the

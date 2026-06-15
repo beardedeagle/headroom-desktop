@@ -1830,6 +1830,13 @@ select {
   background: #FFF1E8;
 }
 
+/* Auto-pause (watchdog gave up) is a warning state, not a calm user pause.
+   Uses semantic --warning tokens so it stays readable in light AND dark mode,
+   unlike the sibling theme-invariant pastel tones above (Stage 4 backlog). */
+.callout-banner--auto-paused {
+  background: var(--warning-tint);
+}
+
 .callout-banner--degraded {
   background: #FFF4DD;
 }
@@ -1862,6 +1869,12 @@ select {
 .callout-banner__dot--paused {
   background: #ED834E;
   box-shadow: 0 0 0 0 rgba(237, 131, 78, 0.5);
+  animation: none;
+}
+
+.callout-banner__dot--auto-paused {
+  background: var(--warning);
+  box-shadow: 0 0 0 0 var(--warning-tint);
   animation: none;
 }
 
@@ -1926,6 +1939,23 @@ select {
 .callout-banner__action:disabled {
   cursor: not-allowed;
   opacity: 0.6;
+}
+
+.callout-banner__resume {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+/* Left-align the button inside the body column (the base rule pushes it right
+   for the top-level banner action). */
+.callout-banner__resume .callout-banner__action {
+  margin-left: 0;
+}
+
+.callout-banner .callout-banner__error {
+  color: var(--danger);
 }
 
 .tier-mismatch-banner {

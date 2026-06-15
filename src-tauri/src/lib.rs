@@ -1063,9 +1063,17 @@ pub(crate) fn build_watchdog_give_up_report(
 /// so a `timeout` here corresponds to the same wait the watchdog already
 /// experienced.
 fn probe_backend_readyz_outcome() -> String {
+    probe_backend_readyz_outcome_with_timeout(std::time::Duration::from_millis(1500))
+}
+
+/// Same probe as [`probe_backend_readyz_outcome`] but with a caller-chosen
+/// timeout. The watchdog uses a longer (5s) budget to confirm a failure before
+/// counting a strike, so a niced backend that's merely slow under heavy
+/// compression load isn't mistaken for a dead one.
+fn probe_backend_readyz_outcome_with_timeout(timeout: std::time::Duration) -> String {
     let port = crate::backend_port::get();
     let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_millis(1500))
+        .timeout(timeout)
         .build()
     {
         Ok(c) => c,
@@ -2550,6 +2558,9 @@ fn clear_client_setups() -> Result<(), String> {
 fn pause_headroom(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
     state.set_runtime_paused(true);
+    // A deliberate user pause is not an auto-pause; clear the flag so the
+    // self-heal loop doesn't fight the user by auto-resuming.
+    state.set_runtime_auto_paused(false);
     state.stop_headroom();
     client_adapters::clear_client_setups().map_err(|err| err.to_string())?;
     analytics::track_event(&app, "runtime_paused", None);
@@ -2564,6 +2575,25 @@ fn start_headroom(app: AppHandle) -> Result<(), String> {
         client_adapters::restore_client_setups();
     });
     analytics::track_event(&app, "runtime_resumed", None);
+    Ok(())
+}
+
+/// Hard kill + restart of the proxy, wired to the "Resume" button on the
+/// paused/auto-paused banner. Unlike `start_headroom`/`resume_runtime` — which
+/// no-op when the tracked child is alive-but-hung — this kills the process
+/// group first (`stop_headroom` SIGKILLs the group and reaps orphans), so a
+/// wedged process is actually replaced by a fresh one. This is the one-click
+/// equivalent of the manual quit-and-relaunch users do today.
+#[tauri::command]
+fn force_restart_headroom(app: AppHandle) -> Result<(), String> {
+    let state: tauri::State<'_, AppState> = app.state();
+    state.stop_headroom();
+    state.set_runtime_auto_paused(false);
+    state.resume_runtime().map_err(|err| err.to_string())?;
+    std::thread::spawn(|| {
+        client_adapters::restore_client_setups();
+    });
+    analytics::track_event(&app, "runtime_force_restarted", None);
     Ok(())
 }
 
@@ -2934,6 +2964,7 @@ pub fn run() {
             clear_client_setups,
             pause_headroom,
             start_headroom,
+            force_restart_headroom,
             track_analytics_event,
             show_dashboard_window,
             open_headroom_dashboard,
@@ -3783,6 +3814,21 @@ fn watchdog_should_be_up(
     installed && !paused && !starting && !upgrading && !bypass
 }
 
+/// Backoff schedule for the self-heal auto-resume loop after the watchdog has
+/// given up and auto-paused. Keyed by the number of failed resume attempts so
+/// far: 30s, 1m, 2m, then a 5m cap for all later attempts. Retries continue
+/// indefinitely at the cap so a transient outage (laptop slept on battery,
+/// transient network) self-heals whenever it clears, without hammering restart.
+fn auto_resume_backoff(failed_attempts: u32) -> std::time::Duration {
+    let secs = match failed_attempts {
+        0 => 30,
+        1 => 60,
+        2 => 120,
+        _ => 300,
+    };
+    std::time::Duration::from_secs(secs)
+}
+
 /// Every 5s, check whether the Python proxy is actually reachable while the
 /// app thinks the runtime should be up. If it isn't, try to restart via
 /// `ensure_headroom_running`. After 3 consecutive failures (~15s down) we
@@ -3802,7 +3848,19 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 
     std::thread::spawn(move || {
         let mut consecutive_failures: u32 = 0;
-        let mut last_tick = std::time::Instant::now();
+        // Wall-clock (not `Instant`) timestamp of the previous tick. On macOS
+        // `Instant`/`mach_absolute_time` FREEZES while the system is asleep, so
+        // a laptop that slept for minutes (common on battery) would measure as
+        // only a few seconds of monotonic time and the `just_resumed` guard
+        // below would never fire — the watchdog would count the sleep as 3
+        // backend failures and auto-pause a perfectly healthy process. The
+        // wall clock advances across sleep, so the resume gap is real.
+        let mut last_tick_wall = std::time::SystemTime::now();
+        // Self-heal scheduling after a give-up auto-pause. `auto_pause_next_retry`
+        // is the earliest Instant at which we re-attempt a resume; `auto_pause_failed`
+        // counts failed attempts to grow the backoff (see `auto_resume_backoff`).
+        let mut auto_pause_next_retry: Option<std::time::Instant> = None;
+        let mut auto_pause_failed: u32 = 0;
         // Set after a forced kill+restart of a hung process. Prevents the
         // hung-kill path from looping forever if the new process also hangs:
         // on the second trip through MAX_CONSECUTIVE_FAILURES we fall through
@@ -3817,13 +3875,47 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 
         loop {
             std::thread::sleep(POLL);
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(last_tick);
-            last_tick = now;
+            let now_wall = std::time::SystemTime::now();
+            let elapsed = now_wall
+                .duration_since(last_tick_wall)
+                .unwrap_or(std::time::Duration::ZERO);
+            last_tick_wall = now_wall;
             let just_resumed = elapsed > RESUME_THRESHOLD;
 
             let state: tauri::State<'_, AppState> = app.state();
             let runtime = state.runtime_status();
+
+            // Self-heal: if a previous give-up auto-paused the runtime, keep
+            // trying to bring it back on a backoff instead of staying dead
+            // until the user intervenes. A deliberate user pause
+            // (auto_paused=false) is never retried here. We clear the pause and
+            // hard-restart, then let the normal path below own the outcome:
+            // it either observes the proxy recover or re-gives-up, which
+            // reschedules the next retry with a longer backoff.
+            if runtime.auto_paused {
+                let due = auto_pause_next_retry
+                    .map(|t| std::time::Instant::now() >= t)
+                    .unwrap_or(true);
+                if due {
+                    log::info!(
+                        "watchdog: auto-resume attempt (failed_attempts={auto_pause_failed}); killing wedged proxy and restarting"
+                    );
+                    // Replace the wedged child outright — `resume_runtime` ->
+                    // `ensure_headroom_running` no-ops on an alive-but-hung
+                    // process (try_wait says running), so a plain resume can't
+                    // fix it. stop_headroom SIGKILLs the group and reaps orphans.
+                    state.stop_headroom();
+                    consecutive_failures = 0;
+                    hung_kill_attempted = false;
+                    if let Err(err) = state.resume_runtime() {
+                        // resume_runtime already cleared the auto_paused flag;
+                        // the normal path will re-give-up and reschedule.
+                        log::info!("watchdog: auto-resume resume_runtime failed: {err:#}");
+                    }
+                    auto_pause_next_retry = None;
+                }
+                continue;
+            }
 
             // Only care when the runtime is supposed to be up: installed,
             // not paused by the user, not mid-boot, not mid-upgrade, and not
@@ -3860,6 +3952,10 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             if runtime.proxy_reachable {
                 consecutive_failures = 0;
                 hung_kill_attempted = false;
+                // Healthy again — reset the self-heal backoff so a future
+                // wedge starts its retries fresh at 30s.
+                auto_pause_failed = 0;
+                auto_pause_next_retry = None;
                 // End of "down episode" — re-arm Sentry capture so a future
                 // crash fires a fresh event.
                 WATCHDOG_DOWN_CAPTURED.store(false, Ordering::Release);
@@ -3881,6 +3977,22 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             if just_resumed {
                 log::info!(
                     "watchdog: probe skipped (system resumed after {elapsed:?}); resetting failure counter"
+                );
+                consecutive_failures = 0;
+                continue;
+            }
+
+            // Tolerant confirmation before counting a strike. The standard
+            // reachability check (`is_headroom_proxy_reachable`) uses a tight
+            // 1.5s timeout via the 6767 intercept; the backend runs niced
+            // (`nice -n 5`), so under heavy compression/embedding load a
+            // perfectly healthy proxy can miss that window. Re-probe the
+            // backend's /readyz directly with a 5s budget — if it answers, the
+            // process is alive and merely busy, so don't count it as down.
+            if probe_backend_readyz_outcome_with_timeout(std::time::Duration::from_secs(5)) == "ok"
+            {
+                log::info!(
+                    "watchdog: backend /readyz answered on tolerant 5s re-probe; not counting failure"
                 );
                 consecutive_failures = 0;
                 continue;
@@ -4001,14 +4113,24 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     .proxy_bypass
                     .store(true, std::sync::atomic::Ordering::Release);
                 state.set_runtime_paused(true);
+                // Mark this as an AUTO pause (distinct from a user pause) so the
+                // self-heal loop above will keep retrying and the UI shows the
+                // "stopped unexpectedly" banner with a Resume button.
+                state.set_runtime_auto_paused(true);
                 state.stop_headroom();
                 analytics::track_event(&app, "runtime_auto_paused", None);
                 let _ = show_notification_impl(
                     &app,
                     "Headroom paused",
-                    "Headroom couldn't restart its proxy. Requests are passing through unmodified — open Headroom to retry.",
+                    "Headroom couldn't restart its proxy. Requests are passing through unmodified — it'll keep retrying automatically, or open Headroom and hit Resume.",
                     Some("connectors".into()),
                 );
+                // Arm the self-heal: first retry after 30s, backing off on
+                // repeated failures (auto_resume_backoff). The retry runs in the
+                // `runtime.auto_paused` branch at the top of the loop.
+                auto_pause_next_retry =
+                    Some(std::time::Instant::now() + auto_resume_backoff(auto_pause_failed));
+                auto_pause_failed = auto_pause_failed.saturating_add(1);
                 consecutive_failures = 0;
                 continue;
             }
@@ -4533,7 +4655,8 @@ mod tests {
         is_prerelease_version, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
         parse_live_learnings, parse_request_count_from_stats_body, parse_updater_endpoint_list,
         pattern_matches_project, physical_rect_from_rect, read_applied_patterns_for_project,
-        resolve_release_updater_config, select_updater_endpoints, store_checked_update,
+        auto_resume_backoff, resolve_release_updater_config, select_updater_endpoints,
+        store_checked_update,
         watchdog_should_be_up, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
         BootstrapFailureKind, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
         InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual,
@@ -5739,6 +5862,19 @@ Some unrelated content.
     #[test]
     fn watchdog_should_be_up_skips_when_pricing_gate_bypassed() {
         assert!(!watchdog_should_be_up(true, false, false, false, true));
+    }
+
+    #[test]
+    fn auto_resume_backoff_escalates_then_caps() {
+        use std::time::Duration;
+        // 30s -> 1m -> 2m for the first three attempts, then a 5m cap that holds
+        // for all later attempts so a persistent outage retries indefinitely
+        // without hammering restart.
+        assert_eq!(auto_resume_backoff(0), Duration::from_secs(30));
+        assert_eq!(auto_resume_backoff(1), Duration::from_secs(60));
+        assert_eq!(auto_resume_backoff(2), Duration::from_secs(120));
+        assert_eq!(auto_resume_backoff(3), Duration::from_secs(300));
+        assert_eq!(auto_resume_backoff(50), Duration::from_secs(300));
     }
 
     #[test]
