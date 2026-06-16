@@ -2242,6 +2242,31 @@ select {
   margin-top: 12px;
 }
 
+/* Startup placeholder shown until native savings history loads, so the sparse
+   tracker-only chart is never flashed. Tokens carry their own dark values, so
+   no separate dark-mode override is needed. */
+.savings-chart__skeleton {
+  display: grid;
+  place-items: center;
+  height: 312px;
+  margin-top: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  background: linear-gradient(
+    90deg,
+    var(--surface-sunken) 0%,
+    var(--fill-hover) 50%,
+    var(--surface-sunken) 100%
+  );
+  background-size: 200% 100%;
+  animation: savings-chart-skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes savings-chart-skeleton-shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
 .savings-chart__panel {
   display: grid;
   gap: 14px;

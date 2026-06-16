@@ -96,6 +96,7 @@ export interface DashboardState {
   sessionSavingsPct: number;
   dailySavings: DailySavingsPoint[];
   hourlySavings: HourlySavingsPoint[];
+  savingsHistoryLoaded: boolean;
   tools: ManagedTool[];
   clients: ClientStatus[];
   recentUsage: UsageEvent[];

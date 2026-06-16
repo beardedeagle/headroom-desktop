@@ -168,6 +168,10 @@ pub struct DashboardState {
     pub session_savings_pct: f64,
     pub daily_savings: Vec<DailySavingsPoint>,
     pub hourly_savings: Vec<HourlySavingsPoint>,
+    /// True once native savings history has loaded at least once this process.
+    /// Until then the Home chart shows a loading state instead of the sparse
+    /// tracker-only layer.
+    pub savings_history_loaded: bool,
     pub tools: Vec<ManagedTool>,
     pub clients: Vec<ClientStatus>,
     pub recent_usage: Vec<UsageEvent>,

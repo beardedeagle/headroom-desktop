@@ -15,6 +15,7 @@ export const mockDashboard: DashboardState = {
   sessionSavingsPct: 0,
   dailySavings: [],
   hourlySavings: [],
+  savingsHistoryLoaded: false,
   tools: [
     {
       id: "headroom",

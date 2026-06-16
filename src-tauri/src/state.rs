@@ -537,6 +537,10 @@ pub struct AppState {
     /// prefetch for this app launch, so `maybe_prefetch_kompress` never fires
     /// the ~260MB download more than once per process.
     kompress_prefetch_attempted: AtomicBool,
+    /// Latched true the first time native savings history loads this process.
+    /// Drives the Home chart's startup loading state so the sparse tracker-only
+    /// layer is never shown before the full history merges in.
+    savings_history_loaded: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -633,6 +637,7 @@ impl AppState {
             cached_headroom_learn_prereq: Mutex::new(None),
             cached_runtime_status: Mutex::new(None),
             kompress_prefetch_attempted: AtomicBool::new(false),
+            savings_history_loaded: AtomicBool::new(false),
         };
 
         Ok(state)
@@ -1910,9 +1915,14 @@ impl AppState {
         // active traffic. A 30s TTL absorbs most dashboard polls while still
         // updating the chart's most-recent bucket within one full refresh.
         const TTL: Duration = Duration::from_secs(30);
+        // A miss (backend not yet reachable on cold start) is cached briefly so
+        // the chart resolves within a few seconds of the backend coming up,
+        // instead of holding the startup loading state for a full 30s.
+        const MISS_TTL: Duration = Duration::from_secs(3);
         let mut cache = self.cached_headroom_history.lock();
         if let Some((history, at)) = cache.as_ref() {
-            if at.elapsed() < TTL {
+            let ttl = if history.is_some() { TTL } else { MISS_TTL };
+            if at.elapsed() < ttl {
                 return history.clone();
             }
         }
@@ -2081,6 +2091,10 @@ impl AppState {
 
         let stats = self.cached_headroom_stats();
         let history = self.cached_headroom_history();
+        if history.is_some() {
+            self.savings_history_loaded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
 
         if let Some(stats) = stats.as_ref() {
             if let Some((updated, updated_daily, updated_hourly, milestones)) =
@@ -2146,6 +2160,9 @@ impl AppState {
                 session_savings_pct: snapshot.session_savings_pct,
                 daily_savings,
                 hourly_savings,
+                savings_history_loaded: self
+                    .savings_history_loaded
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 tools,
                 clients,
                 recent_usage,

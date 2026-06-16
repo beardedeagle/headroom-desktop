@@ -764,6 +764,9 @@ export default function App() {
   const [stepBasePercent, setStepBasePercent] = useState(0);
   const [chartResetSignal, setChartResetSignal] = useState(0);
   const [chartMode, setChartMode] = useState<SavingsChartMode>("usd");
+  // Safety net: if native history never loads (backend unreachable), reveal the
+  // chart anyway after this delay rather than spinning forever.
+  const [historyLoadTimedOut, setHistoryLoadTimedOut] = useState(false);
   const [showSavingsInfo, setShowSavingsInfo] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
   const [autostartBusy, setAutostartBusy] = useState(false);
@@ -837,6 +840,11 @@ export default function App() {
     }
     headroomLogRef.current.scrollTop = headroomLogRef.current.scrollHeight;
   }, [showHeadroomDetails, headroomLogLines]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setHistoryLoadTimedOut(true), 20000);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   useEffect(() => {
     if (!showRtkDetails || !rtkActivityRef.current) {
@@ -4328,13 +4336,19 @@ export default function App() {
               </article>
             </section>
 
-            <DailySavingsChart
-              data={dashboard.dailySavings}
-              hourlyData={dashboard.hourlySavings}
-              resetSignal={chartResetSignal}
-              chartMode={chartMode}
-              setChartMode={setChartMode}
-            />
+            {dashboard.savingsHistoryLoaded || historyLoadTimedOut ? (
+              <DailySavingsChart
+                data={dashboard.dailySavings}
+                hourlyData={dashboard.hourlySavings}
+                resetSignal={chartResetSignal}
+                chartMode={chartMode}
+                setChartMode={setChartMode}
+              />
+            ) : (
+              <div className="savings-chart__skeleton" role="status">
+                <p className="loading-copy">Loading savings history…</p>
+              </div>
+            )}
 
           </div>
 
